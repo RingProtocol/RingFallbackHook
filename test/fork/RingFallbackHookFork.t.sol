@@ -69,8 +69,8 @@ contract SafeSwapRouter is IUnlockCallback {
     }
 }
 
-/// @notice Mainnet fork test: verifies the hook can route through the real fwUSDC/fwUSDT v4 pool
-///         when its price is better, and fall back to the cur pool otherwise.
+/// @notice Mainnet fork test: verifies explicit routing through the real fwUSDC/fwUSDT v4 pool
+///         and default routing through the cur pool.
 contract RingFallbackHookForkTest is Test {
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
@@ -179,7 +179,6 @@ contract RingFallbackHookForkTest is Test {
     function test_realSwapFallsBackToCurWhenPriceEqual() public requireFork {
         // cur initialized at fb price -> prices equal -> cur handles the swap.
         (uint160 curPriceBefore,,,) = manager.getSlot0(curPoolId);
-        (uint160 fbPriceBefore,,,) = manager.getSlot0(FB_POOL_ID);
 
         _swapAsUser(true, -int256(SWAP_AMOUNT));
 
@@ -189,7 +188,7 @@ contract RingFallbackHookForkTest is Test {
     }
 
     function test_realHookBalancesZeroAfterSwap() public requireFork {
-        _swapAsUser(true, -int256(SWAP_AMOUNT));
+        _swapAsUser(true, -int256(SWAP_AMOUNT), _fallbackData(1));
 
         assertEq(IERC20(USDC).balanceOf(address(hook)), 0, "hook USDC");
         assertEq(IERC20(USDT).balanceOf(address(hook)), 0, "hook USDT");
@@ -201,7 +200,7 @@ contract RingFallbackHookForkTest is Test {
         uint256 managerUsdcBefore = IERC20(USDC).balanceOf(address(manager));
         uint256 managerUsdtBefore = IERC20(USDT).balanceOf(address(manager));
 
-        _swapAsUser(true, -int256(SWAP_AMOUNT));
+        _swapAsUser(true, -int256(SWAP_AMOUNT), _fallbackData(1));
 
         // PoolManager inventory should be restored after settlement.
         assertEq(IERC20(USDC).balanceOf(address(manager)), managerUsdcBefore, "manager USDC restored");
@@ -212,14 +211,14 @@ contract RingFallbackHookForkTest is Test {
         // USDC -> USDT
         uint256 usdcBefore = IERC20(USDC).balanceOf(USER);
         uint256 usdtBefore = IERC20(USDT).balanceOf(USER);
-        _swapAsUser(true, -int256(SWAP_AMOUNT));
+        _swapAsUser(true, -int256(SWAP_AMOUNT), _fallbackData(1));
         assertEq(usdcBefore - IERC20(USDC).balanceOf(USER), SWAP_AMOUNT, "USDC consumed");
         assertGt(IERC20(USDT).balanceOf(USER), usdtBefore, "USDT received");
 
         // USDT -> USDC
         usdcBefore = IERC20(USDC).balanceOf(USER);
         usdtBefore = IERC20(USDT).balanceOf(USER);
-        _swapAsUser(false, -int256(SWAP_AMOUNT));
+        _swapAsUser(false, -int256(SWAP_AMOUNT), _fallbackData(1));
         assertEq(usdtBefore - IERC20(USDT).balanceOf(USER), SWAP_AMOUNT, "USDT consumed");
         assertGt(IERC20(USDC).balanceOf(USER), usdcBefore, "USDC received");
     }
@@ -229,6 +228,13 @@ contract RingFallbackHookForkTest is Test {
     // ---------------------------------------------------------------------
 
     function _swapAsUser(bool zeroForOne, int256 amountSpecified) internal returns (BalanceDelta) {
+        return _swapAsUser(zeroForOne, amountSpecified, bytes(""));
+    }
+
+    function _swapAsUser(bool zeroForOne, int256 amountSpecified, bytes memory hookData)
+        internal
+        returns (BalanceDelta)
+    {
         vm.prank(USER);
         return swapRouter.swap(
             curKey,
@@ -237,8 +243,12 @@ contract RingFallbackHookForkTest is Test {
                 amountSpecified: amountSpecified,
                 sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
-            bytes("")
+            hookData
         );
+    }
+
+    function _fallbackData(uint256 amountLimit) internal view returns (bytes memory) {
+        return abi.encode(block.timestamp + 1 hours, amountLimit);
     }
 
     function _invertPrice(uint160 sqrtPriceX96) internal pure returns (uint160) {

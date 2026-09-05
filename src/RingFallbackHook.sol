@@ -27,25 +27,23 @@ import {IFewFactory} from "./interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "./interfaces/external/IFewWrappedToken.sol";
 
 /// @title RingFallbackHook
-/// @notice A v4 hook that exposes an origin-token A/B pool (cur pool) with real liquidity, but
-///         transparently routes each swap to the better-priced liquidity source: the cur pool
-///         itself, or the hookless fwA/fwB FewToken fallback pool (fb pool).
+/// @notice A v4 hook that exposes an origin-token A/B pool (cur pool) and supports an explicitly
+///         requested route through the hookless fwA/fwB FewToken fallback pool (fb pool).
 ///
 /// @dev Core logic:
-///      On every swap, the hook derives the fb fwA/fwB pool key from the cur pool's tokens
-///      (wrap to fewToken via FewFactory, same fee/tickSpacing, hookless). It compares the marginal
-///      price (sqrtPriceX96) of both pools. If the fb pool offers a better price for the swap
-///      direction, the hook executes the swap through the fb pool (take origin -> wrap -> fb
-///      swap -> unwrap -> settle) and returns a BeforeSwapDelta that replaces the cur swap.
-///      Otherwise, it returns a zero delta and lets the cur pool handle the swap normally.
+///      Empty hookData selects the cur pool. To select the fb pool, the caller supplies
+///      abi.encode(deadline, amountLimit), where amountLimit is the minimum output for exact-input
+///      swaps or maximum input for exact-output swaps. The hook derives the fb pool from FewFactory,
+///      executes the requested swap, enforces the limit against the actual result, and returns a
+///      BeforeSwapDelta that replaces the cur swap.
 ///
-///      If the fb pool is unavailable (not initialized, no liquidity, no wrapper, or insufficient
-///      PoolManager inventory for the flash conversion), the hook gracefully falls back to the cur
-///      pool.
+///      An explicit fb request reverts if the route is unavailable, expired, underfilled, exceeds
+///      its amount limit, or lacks sufficient PoolManager inventory.
 ///
 ///      Safety model:
 ///      - no owner, upgrade, pause, fee, sweep, or route setter;
 ///      - anyone may add liquidity to the cur pool;
+///      - callers select routes using full off-chain quotes instead of manipulable marginal prices;
 ///      - the fb pool key is derived purely from the cur pool key and FewFactory state;
 ///      - wrap/unwrap are strict 1:1 with return-value and balance checks;
 ///      - exact-input and exact-output requests must fill completely or the whole transaction reverts;
@@ -73,7 +71,12 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     error TokenBalanceMismatch(address token, uint256 expectedBalance, uint256 actualBalance);
     error SettlementAmountMismatch(address token, uint256 paid, uint256 expected);
     error AmountOutOfRange(int256 amountSpecified);
-    error UnexpectedHookData();
+    error InvalidHookData();
+    error InvalidFallbackAmountLimit();
+    error FallbackRequestExpired(uint256 deadline, uint256 currentTimestamp);
+    error FallbackRouteUnavailable();
+    error FallbackOutputTooLow(uint256 actual, uint256 minimum);
+    error FallbackInputTooHigh(uint256 actual, uint256 maximum);
 
     event FallbackSwap(
         PoolId indexed curPoolId,
@@ -120,47 +123,42 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         nonReentrant
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        if (hookData.length != 0) revert UnexpectedHookData();
         _validateAmount(params.amountSpecified);
 
         PoolId curPoolId = key.toId();
+        if (hookData.length == 0) {
+            emit FallbackSwap(curPoolId, PoolId.wrap(0), sender, params.zeroForOne, false, params.amountSpecified, 0, 0);
+            return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
+        }
+        if (hookData.length != 64) revert InvalidHookData();
 
-        // Derive fb fwA/fwB pool key from the cur pool's tokens.
+        (uint256 deadline, uint256 amountLimit) = abi.decode(hookData, (uint256, uint256));
+        if (block.timestamp > deadline) revert FallbackRequestExpired(deadline, block.timestamp);
+        if (amountLimit == 0) revert InvalidFallbackAmountLimit();
+
         FbRoute memory route = _deriveFbRoute(key);
-        if (!route.available) {
-            // fb pool unavailable -- let the cur pool handle the swap.
-            emit FallbackSwap(curPoolId, route.fbPoolId, sender, params.zeroForOne, false, params.amountSpecified, 0, 0);
-            return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
-        }
+        if (!route.available) revert FallbackRouteUnavailable();
 
-        // Compare marginal prices to decide which pool is better for this swap direction.
-        bool useFb = _isFbPriceBetter(route, params.zeroForOne);
-        if (!useFb) {
-            emit FallbackSwap(curPoolId, route.fbPoolId, sender, params.zeroForOne, false, params.amountSpecified, 0, 0);
-            return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
-        }
-
-        // Check flash inventory before committing to the fb route.
-        uint256 requestedInput =
-            params.amountSpecified < 0 ? uint256(-params.amountSpecified) : _quoteFbOutput(route, params);
-        address inputToken = params.zeroForOne ? route.token0 : route.token1;
-        if (IERC20(inputToken).balanceOf(address(poolManager)) < requestedInput) {
-            // Insufficient PoolManager inventory -- fall back to cur pool.
-            emit FallbackSwap(curPoolId, route.fbPoolId, sender, params.zeroForOne, false, params.amountSpecified, 0, 0);
-            return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
-        }
-
-        // Execute the swap through the fb fwA/fwB pool.
         bool fbZeroForOne = params.zeroForOne == route.orderAligned;
         (uint256 amountIn, uint256 amountOut) =
             _executeFbSwap(route, fbZeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
+
+        if (params.amountSpecified < 0) {
+            if (amountOut < amountLimit) revert FallbackOutputTooLow(amountOut, amountLimit);
+        } else if (amountIn > amountLimit) {
+            revert FallbackInputTooHigh(amountIn, amountLimit);
+        }
+
+        address inputToken = params.zeroForOne ? route.token0 : route.token1;
+        uint256 availableInput = IERC20(inputToken).balanceOf(address(poolManager));
+        if (availableInput < amountIn) {
+            revert InsufficientSettlementInventory(inputToken, availableInput, amountIn);
+        }
+
         _convertAndSettle(route, params.zeroForOne, amountIn, amountOut);
 
-        // Return a BeforeSwapDelta that replaces the cur swap.
-        // specifiedDelta = -amountSpecified makes amountToSwap = 0 (cur pool no-op).
         int128 specifiedDelta = (-params.amountSpecified).toInt128();
-        int128 unspecifiedDelta =
-            params.amountSpecified < 0 ? -amountOut.toInt128() : amountIn.toInt128();
+        int128 unspecifiedDelta = params.amountSpecified < 0 ? -amountOut.toInt128() : amountIn.toInt128();
 
         emit FallbackSwap(
             curPoolId, route.fbPoolId, sender, params.zeroForOne, true, params.amountSpecified, amountIn, amountOut
@@ -183,8 +181,6 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         PoolId fbPoolId;
         bool orderAligned;
         bool available;
-        uint160 fbSqrtPriceX96;
-        uint160 curSqrtPriceX96;
     }
 
     function _deriveFbRoute(PoolKey calldata key) internal view returns (FbRoute memory route) {
@@ -233,17 +229,11 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             tickSpacing: key.tickSpacing,
             fbPoolId: fbPoolId,
             orderAligned: orderAligned,
-            available: true,
-            fbSqrtPriceX96: fbPrice,
-            curSqrtPriceX96: curPrice
+            available: true
         });
     }
 
-    function _emptyRoute(address token0, address token1, PoolKey calldata key)
-        internal
-        pure
-        returns (FbRoute memory)
-    {
+    function _emptyRoute(address token0, address token1, PoolKey calldata key) internal pure returns (FbRoute memory) {
         return FbRoute({
             token0: token0,
             token1: token1,
@@ -253,9 +243,7 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             tickSpacing: key.tickSpacing,
             fbPoolId: PoolId.wrap(0),
             orderAligned: false,
-            available: false,
-            fbSqrtPriceX96: 0,
-            curSqrtPriceX96: 0
+            available: false
         });
     }
 
@@ -277,48 +265,18 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             tickSpacing: key.tickSpacing,
             fbPoolId: fbPoolId,
             orderAligned: orderAligned,
-            available: false,
-            fbSqrtPriceX96: 0,
-            curSqrtPriceX96: 0
+            available: false
         });
-    }
-
-    // ---------------------------------------------------------------------
-    // Price comparison
-    // ---------------------------------------------------------------------
-
-    /// @dev Compares marginal prices (sqrtPriceX96) of the cur and fb pools.
-    ///      For zeroForOne (selling token0, buying token1), a higher sqrtPriceX96 means
-    ///      more token1 per token0 -- better for the seller.
-    ///      For oneForZero (selling token1, buying token0), a lower sqrtPriceX96 means
-    ///      more token0 per token1 -- better for the seller.
-    ///      When the fb pool's token order is reversed (!orderAligned), its sqrtPriceX96
-    ///      is inverted: normalized = 2^192 / fbSqrtPriceX96.
-    function _isFbPriceBetter(FbRoute memory route, bool zeroForOne) internal pure returns (bool) {
-        uint256 curPrice = route.curSqrtPriceX96;
-        uint256 fbPrice = route.fbSqrtPriceX96;
-
-        if (route.orderAligned) {
-            // fb pool has same token order as cur -- prices directly comparable.
-            return zeroForOne ? fbPrice > curPrice : fbPrice < curPrice;
-        } else {
-            // fb pool has reversed token order -- invert fb price.
-            // normalized = (2^96)^2 / fbPrice = 2^192 / fbPrice
-            uint256 fbNormalized = FullMath.mulDiv(1 << 96, 1 << 96, fbPrice);
-            return zeroForOne ? fbNormalized > curPrice : fbNormalized < curPrice;
-        }
     }
 
     // ---------------------------------------------------------------------
     // fb swap execution
     // ---------------------------------------------------------------------
 
-    function _executeFbSwap(
-        FbRoute memory route,
-        bool fbZeroForOne,
-        int256 amountSpecified,
-        uint160 curPriceLimitX96
-    ) internal returns (uint256 amountIn, uint256 amountOut) {
+    function _executeFbSwap(FbRoute memory route, bool fbZeroForOne, int256 amountSpecified, uint160 curPriceLimitX96)
+        internal
+        returns (uint256 amountIn, uint256 amountOut)
+    {
         PoolKey memory fbKey = PoolKey({
             currency0: Currency.wrap(route.orderAligned ? route.few0 : route.few1),
             currency1: Currency.wrap(route.orderAligned ? route.few1 : route.few0),
@@ -347,26 +305,7 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         if (actualSpecified != expected) revert FbSwapPartialFill(actualSpecified, expected);
     }
 
-    /// @dev For exact-output swaps, we need an estimate of the input amount to check inventory.
-    ///      This uses the fb pool's marginal price as a lower bound -- the actual input may be
-    ///      higher due to slippage. The real check happens during execution.
-    function _quoteFbOutput(FbRoute memory route, SwapParams calldata params)
-        internal
-        pure
-        returns (uint256)
-    {
-        // Conservative estimate: for exact output, input >= output * (price ratio).
-        // Using marginal price as a lower bound; actual execution will revert if insufficient.
-        uint256 exactOutput = uint256(params.amountSpecified);
-        // Add 10% buffer for slippage + fees.
-        return exactOutput + (exactOutput / 10);
-    }
-
-    function _mapFbPriceLimit(bool orderAligned, bool fbZeroForOne, uint160 curLimit)
-        internal
-        pure
-        returns (uint160)
-    {
+    function _mapFbPriceLimit(bool orderAligned, bool fbZeroForOne, uint160 curLimit) internal pure returns (uint160) {
         if (orderAligned) return curLimit;
 
         uint256 mapped = fbZeroForOne
@@ -386,9 +325,7 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     // Convert and settle
     // ---------------------------------------------------------------------
 
-    function _convertAndSettle(FbRoute memory route, bool curZeroForOne, uint256 amountIn, uint256 amountOut)
-        internal
-    {
+    function _convertAndSettle(FbRoute memory route, bool curZeroForOne, uint256 amountIn, uint256 amountOut) internal {
         Currency input = Currency.wrap(curZeroForOne ? route.token0 : route.token1);
         Currency output = Currency.wrap(curZeroForOne ? route.token1 : route.token0);
         address fewIn = curZeroForOne ? route.few0 : route.few1;

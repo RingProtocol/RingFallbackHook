@@ -4,81 +4,68 @@
 
 ## Overview
 
-`RingFallbackHook` is a Uniswap v4 hook that provides **smart routing** for an origin-token A/B pool. On every swap, the hook compares the marginal price of the current A/B pool (cur pool) against the corresponding hookless fwA/fwB FewToken fallback pool (fb pool), and **automatically executes against whichever pool offers the better price**.
+`RingFallbackHook` is a Uniswap v4 hook that exposes two explicitly selected routes for an origin-token A/B pool:
+
+- **Cur route:** empty `hookData` always leaves the swap in the current A/B pool (cur pool).
+- **Fb route:** non-empty `hookData` must be `abi.encode(uint256 deadline, uint256 amountLimit)` and explicitly requests execution through the corresponding hookless fwA/fwB FewToken fallback pool (fb pool).
+
+The hook does not compare spot prices or automatically select a route. An off-chain quoter or router must obtain full, trade-size-aware quotes for both routes, compare them, and submit the selected route with appropriate safeguards.
 
 ```
-User swaps A -> B (via Universal Router)
+Off-chain quoter compares complete cur and fb route quotes
   |
-  +-- hook compares cur A/B pool vs fb fwA/fwB pool sqrtPriceX96
+  +-- choose cur -> pass empty hookData -> cur pool executes normally
+  |                                      (FewToken not touched)
   |
-  +-- fb is better -> take A -> wrap fwA -> fb swap -> unwrap fwB -> settle B
-  |                   (cur pool swap replaced by BeforeSwapDelta no-op)
-  |
-  +-- cur is better -> return zero delta, cur pool executes normally
-                       (FewToken not touched)
+  +-- choose fb  -> pass abi.encode(deadline, amountLimit)
+                    -> take A -> wrap fwA -> fb swap -> unwrap fwB -> settle B
+                    (cur pool swap replaced by BeforeSwapDelta no-op)
 ```
 
 ## Core Logic
 
-**If the cur pool's quote is worse than the FewToken fallback pool's quote, use the fb pool.**
+1. `beforeSwap` intercepts each swap request.
+2. Empty `hookData` returns a zero delta, so the cur pool executes normally.
+3. Non-empty `hookData` must be exactly the ABI encoding of `(uint256 deadline, uint256 amountLimit)` and explicitly selects fb.
+4. The hook derives fwA/fwB from the cur pool's token0/token1 through `FewFactory.getWrappedToken()`.
+5. It constructs the hookless fb pool key with the same fee and tick spacing.
+6. It executes the fb swap, verifies a complete fill, and checks `amountLimit` against the actual result.
+7. It returns a `BeforeSwapDelta` that replaces the cur swap.
 
-Implementation:
-1. `beforeSwap` intercepts every swap request
-2. Derives fwA/fwB from the cur pool's token0/token1 via `FewFactory.getWrappedToken()`
-3. Constructs the fb pool key: `PoolKey(fwA, fwB, same fee, same tickSpacing, address(0))`
-4. Reads both pools' `sqrtPriceX96` and compares marginal prices by swap direction
-5. If fb is better and PoolManager inventory is sufficient -> execute fb swap, return `BeforeSwapDelta` to replace the cur swap
-6. Otherwise -> return zero delta, cur pool handles the swap
+### Fallback Request Limits
 
-### Price Comparison Rules
+| Swap type | `amountSpecified` | Meaning of `amountLimit` | Result check |
+|---|---:|---|---|
+| Exact-input | `< 0` | Minimum acceptable output | `actualAmountOut >= amountLimit` |
+| Exact-output | `> 0` | Maximum acceptable input | `actualAmountIn <= amountLimit` |
 
-`sqrtPriceX96 = sqrt(price1/price0) * 2^96`
+`amountLimit` must be nonzero. The request reverts if the deadline has expired, the encoding is invalid, the fallback route is unavailable, the swap only partially fills, the actual result violates the limit, or PoolManager inventory is insufficient. An explicit fb request never silently degrades to the cur route.
 
-| Swap direction | Better price | fb is better when |
-|----------------|-------------|---------------------|
-| zeroForOne (sell token0, buy token1) | higher sqrtPriceX96 | fbPrice > curPrice |
-| oneForZero (sell token1, buy token0) | lower sqrtPriceX96 | fbPrice < curPrice |
-
-When the fb pool's token order is reversed (`!orderAligned`), its `sqrtPriceX96` must be inverted: `normalized = 2^192 / fbSqrtPriceX96`.
-
-### Graceful Fallback
-
-The hook automatically falls back to the cur pool when:
-- FewFactory has no registered wrapper for one of the tokens
-- fb pool is not initialized or has no active liquidity
-- cur pool is not initialized
-- PoolManager global balance is insufficient for the flash conversion
-- fb pool price is not better than cur pool price
+The empty-data cur path does not apply the fb `deadline` or `amountLimit`. Cur-route protection therefore relies on the router's and user's normal safeguards, including the swap price limit and any router-level deadline or minimum-output/maximum-input checks.
 
 ## Design Constraints
 
 | Item | Choice |
 |------|--------|
+| Route selection | Explicit; empty data selects cur, encoded data selects fb |
+| Quote comparison | Required off chain using complete route quotes |
 | Constructor | Only `_poolManager` and `_fewFactory`, no poolId |
 | fb pool derivation | Derived from cur pool key's token wrappers, same fee/tickSpacing, hookless |
 | Liquidity | Anyone may add liquidity to the cur pool |
 | Admin powers | No owner, proxy, pause, route setter, fee setter, or sweep |
 | Extra fees | None; users only pay the executed pool's LP/protocol fee |
 | Wrap/unwrap | Strict 1:1, return value and balance change both checked |
-| Native ETH | Not supported; WETH works as a regular ERC-20 |
+| Native ETH | Cur follows standard v4 behavior; fb routing requires ERC-20 currencies, so use WETH |
 
 ### Hook Permissions
 
 ```
-beforeSwap: true            <- intercept swap for price comparison and routing
-beforeSwapReturnDelta: true <- replace cur swap when fb is better
+beforeSwap: true            <- interpret the explicit route request
+beforeSwapReturnDelta: true <- replace the cur swap for an fb request
 all others: false
 ```
 
 Permission mask = `0x88` (`BEFORE_SWAP_FLAG | BEFORE_SWAP_RETURNS_DELTA_FLAG`)
-
-### Price Comparison Limitations
-
-V1 uses marginal price (`sqrtPriceX96`) for comparison, which does not account for:
-- Trade size vs liquidity depth (large trades may get different actual output due to slippage)
-- Liquidity distribution differences between the two pools
-
-For large trades, the pool with a better marginal price may produce a worse actual output due to slippage. A future version could use V4Quoter for full quote comparison.
 
 ## Deployment
 
@@ -127,10 +114,9 @@ Anyone can add liquidity to the cur pool (the hook does not intercept liquidity 
 
 ## Usage
 
-For frontend users, it works exactly like a normal v4 pool -- swap via Universal Router. The hook transparently selects the better route.
+The caller must quote both routes off chain before choosing `hookData`.
 
 ```solidity
-// Standard V4 swap
 PoolKey memory curKey = PoolKey({
     currency0: USDC,
     currency1: USDT,
@@ -139,12 +125,22 @@ PoolKey memory curKey = PoolKey({
     hooks: IHooks(fallbackHookAddress)
 });
 
-poolManager.swap(curKey, SwapParams({
+SwapParams memory params = SwapParams({
     zeroForOne: true,
-    amountSpecified: -1e6,
+    amountSpecified: -1e6, // exact-input
     sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-}), "");
+});
+
+// Explicit cur route:
+poolManager.swap(curKey, params, "");
+
+// Explicit fb route, after an off-chain quote comparison:
+uint256 deadline = block.timestamp + 5 minutes;
+uint256 minimumOutput = quotedFbOutput * 99 / 100;
+poolManager.swap(curKey, params, abi.encode(deadline, minimumOutput));
 ```
+
+For an exact-output swap, encode the maximum acceptable input instead of a minimum output. Integrators must propagate the encoded bytes through the selected v4-compatible router.
 
 ## Contract Addresses
 
@@ -175,4 +171,4 @@ forge script script/DeployLocal.s.sol \
   --broadcast -vvv
 ```
 
-The script outputs all deployed contract addresses and the test swap result, confirming whether the fb pool or cur pool was used.
+The script outputs all deployed contract addresses and the test swap result, confirming whether the requested fb pool or cur pool was used.

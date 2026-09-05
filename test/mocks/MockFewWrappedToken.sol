@@ -67,7 +67,6 @@ contract MockFewWrappedToken is IFewWrappedToken {
     // ---------------------------------------------------------------------
     // Internal
     // ---------------------------------------------------------------------
-
     function _mint(address to, uint256 amount) internal {
         totalSupply += amount;
         balanceOf[to] += amount;
@@ -86,15 +85,13 @@ contract MockFewWrappedToken is IFewWrappedToken {
     }
 
     function _transferFromUnderlying(address from, address to, uint256 amount) internal {
-        (bool ok, bytes memory data) = underlying.call(
-            abi.encodeWithSignature("transferFrom(address,address,uint256)", from, to, amount)
-        );
+        (bool ok, bytes memory data) =
+            underlying.call(abi.encodeWithSignature("transferFrom(address,address,uint256)", from, to, amount));
         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transferFrom failed");
     }
 
     function _sendUnderlying(address to, uint256 amount) internal {
-        (bool ok, bytes memory data) =
-            underlying.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        (bool ok, bytes memory data) = underlying.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
     }
 }

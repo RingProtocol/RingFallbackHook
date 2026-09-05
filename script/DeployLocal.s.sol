@@ -93,13 +93,11 @@ contract DeployLocal is Script {
         //    forge script uses the standard CREATE2 deployer (0x4e59b4...) for new{salt} deployments.
         address create2Deployer = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
-        bytes memory constructorArgs =
-            abi.encode(IPoolManager(address(manager)), IFewFactory(address(factory)));
+        bytes memory constructorArgs = abi.encode(IPoolManager(address(manager)), IFewFactory(address(factory)));
         (address expectedHook, bytes32 salt) =
             HookMiner.find(create2Deployer, flags, type(RingFallbackHook).creationCode, constructorArgs);
-        RingFallbackHook hook = new RingFallbackHook{salt: salt}(
-            IPoolManager(address(manager)), IFewFactory(address(factory))
-        );
+        RingFallbackHook hook =
+            new RingFallbackHook{salt: salt}(IPoolManager(address(manager)), IFewFactory(address(factory)));
         require(address(hook) == expectedHook, "hook address mismatch");
         console2.log("RingFallbackHook:", address(hook));
 
@@ -149,10 +147,7 @@ contract DeployLocal is Script {
         // 10. Add liquidity to cur pool
         {
             ModifyLiquidityParams memory params = ModifyLiquidityParams({
-                tickLower: -120,
-                tickUpper: 120,
-                liquidityDelta: int128(int256(LIQUIDITY)),
-                salt: 0
+                tickLower: -120, tickUpper: 120, liquidityDelta: int128(int256(LIQUIDITY)), salt: 0
             });
             liquidityRouter.modifyLiquidity(curKey, params, bytes(""));
         }
@@ -189,16 +184,13 @@ contract DeployLocal is Script {
 
         {
             ModifyLiquidityParams memory params = ModifyLiquidityParams({
-                tickLower: -7000,
-                tickUpper: 7000,
-                liquidityDelta: int128(int256(LIQUIDITY)),
-                salt: 0
+                tickLower: -7000, tickUpper: 7000, liquidityDelta: int128(int256(LIQUIDITY)), salt: 0
             });
             liquidityRouter.modifyLiquidity(fbKey, params, bytes(""));
         }
         console2.log("Fb pool liquidity added:", LIQUIDITY);
 
-        // 12. Test swap: zeroForOne (should use fb pool since it has better price)
+        // 12. Test swap: explicitly route zeroForOne through the fb pool
         uint256 tokenInBefore;
         uint256 tokenOutBefore;
         if (orderAligned) {
@@ -219,12 +211,10 @@ contract DeployLocal is Script {
         BalanceDelta swapDelta = swapRouter.swap(
             curKey,
             SwapParams({
-                zeroForOne: true,
-                amountSpecified: -int256(SWAP_AMOUNT),
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: true, amountSpecified: -int256(SWAP_AMOUNT), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
             }),
             settings,
-            bytes("")
+            abi.encode(block.timestamp + 1 hours, uint256(1))
         );
 
         (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
@@ -255,8 +245,8 @@ contract DeployLocal is Script {
         // Verify hook has no residual balances
         require(
             IERC20(address(tokenA)).balanceOf(address(hook)) == 0
-                && IERC20(address(tokenB)).balanceOf(address(hook)) == 0
-                && IERC20(fewA).balanceOf(address(hook)) == 0 && IERC20(fewB).balanceOf(address(hook)) == 0,
+                && IERC20(address(tokenB)).balanceOf(address(hook)) == 0 && IERC20(fewA).balanceOf(address(hook)) == 0
+                && IERC20(fewB).balanceOf(address(hook)) == 0,
             "hook has residual balances"
         );
         console2.log("Hook balances: all zero (OK)");
