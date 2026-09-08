@@ -1,36 +1,24 @@
 # RingFallbackHook
 
-> Status: not deployed, not audited
 
 ## Overview
 
-`RingFallbackHook` is a Uniswap v4 hook that exposes two explicitly selected routes for an origin-token A/B pool:
+`RingFallbackHook` is a Uniswap v4 hook that automatically routes swaps to whichever pool has the better marginal spot price: the origin-token cur pool or the hookless fwA/fwB FewToken fallback pool (fb pool).
 
-- **Cur route:** empty `hookData` always leaves the swap in the current A/B pool (cur pool).
-- **Fb route:** non-empty `hookData` must be `abi.encode(uint256 deadline, uint256 amountLimit)` and explicitly requests execution through the corresponding hookless fwA/fwB FewToken fallback pool (fb pool).
-
-The hook does not compare spot prices or automatically select a route. An off-chain quoter or router must obtain full, trade-size-aware quotes for both routes, compare them, and submit the selected route with appropriate safeguards.
+- **Routing:** always compares cur and fb `sqrtPriceX96`. Routes to fb when strictly better; otherwise cur executes normally.
+- **Slippage protection:** empty `hookData` uses cur's marginal estimate as the safety bound. Non-empty `hookData` (`abi.encode(deadline, amountLimit)`) uses the caller's limit for full slippage protection.
 
 ```
-Off-chain quoter compares complete cur and fb route quotes
+beforeSwap receives swap request
   |
-  +-- choose cur -> pass empty hookData -> cur pool executes normally
-  |                                      (FewToken not touched)
+  +-- compare cur and fb sqrtPriceX96
   |
-  +-- choose fb  -> pass abi.encode(deadline, amountLimit)
-                    -> take A -> wrap fwA -> fb swap -> unwrap fwB -> settle B
-                    (cur pool swap replaced by BeforeSwapDelta no-op)
+  +-- fb strictly better and available?
+  |     YES -> execute fb
+  |           -> hookData empty? safety check vs cur marginal
+  |           -> hookData non-empty? check caller's (deadline, amountLimit)
+  |     NO  -> cur pool executes normally (hookData ignored)
 ```
-
-## Core Logic
-
-1. `beforeSwap` intercepts each swap request.
-2. Empty `hookData` returns a zero delta, so the cur pool executes normally.
-3. Non-empty `hookData` must be exactly the ABI encoding of `(uint256 deadline, uint256 amountLimit)` and explicitly selects fb.
-4. The hook derives fwA/fwB from the cur pool's token0/token1 through `FewFactory.getWrappedToken()`.
-5. It constructs the hookless fb pool key with the same fee and tick spacing.
-6. It executes the fb swap, verifies a complete fill, and checks `amountLimit` against the actual result.
-7. It returns a `BeforeSwapDelta` that replaces the cur swap.
 
 ### Fallback Request Limits
 
@@ -47,8 +35,8 @@ The empty-data cur path does not apply the fb `deadline` or `amountLimit`. Cur-r
 
 | Item | Choice |
 |------|--------|
-| Route selection | Explicit; empty data selects cur, encoded data selects fb |
-| Quote comparison | Required off chain using complete route quotes |
+| Route selection | Always spot-price comparison; hookData only controls slippage protection strength |
+| Quote comparison | Marginal spot price; caller-supplied limits optional via hookData |
 | Constructor | Only `_poolManager` and `_fewFactory`, no poolId |
 | fb pool derivation | Derived from cur pool key's token wrappers, same fee/tickSpacing, hookless |
 | Liquidity | Anyone may add liquidity to the cur pool |
@@ -114,7 +102,7 @@ Anyone can add liquidity to the cur pool (the hook does not intercept liquidity 
 
 ## Usage
 
-The caller must quote both routes off chain before choosing `hookData`.
+The hook always compares spot prices and picks the better pool. `hookData` is optional and only provides stronger slippage protection when fb is chosen.
 
 ```solidity
 PoolKey memory curKey = PoolKey({
@@ -131,10 +119,11 @@ SwapParams memory params = SwapParams({
     sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
 });
 
-// Explicit cur route:
+// Default: hook compares spot prices and picks the better pool.
+// If fb is chosen, cur's marginal estimate is used as the safety bound.
 poolManager.swap(curKey, params, "");
 
-// Explicit fb route, after an off-chain quote comparison:
+// Optional: provide stronger slippage protection when fb is chosen:
 uint256 deadline = block.timestamp + 5 minutes;
 uint256 minimumOutput = quotedFbOutput * 99 / 100;
 poolManager.swap(curKey, params, abi.encode(deadline, minimumOutput));

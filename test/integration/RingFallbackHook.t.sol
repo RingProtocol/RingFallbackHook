@@ -276,7 +276,9 @@ contract RingFallbackHookTest is Test {
         assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
     }
 
-    function test_usesExplicitFbWhenSpotPriceIsWorse() public {
+    function test_usesCurWhenFbSpotPriceWorse_evenWithHookData() public {
+        // fb spot price is worse → cur is used regardless of hookData.
+        // Set fb price to the "better for oneForZero" value, but swap zeroForOne.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterOneForZero());
         _addCurLiquidity(1e18);
@@ -285,12 +287,13 @@ contract RingFallbackHookTest is Test {
         (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
         (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
 
+        // zeroForOne swap: fb price is set for better oneForZero, so fb is worse for zeroForOne.
         _swapAsUser(true, -int256(SWAP_AMOUNT / 1000), _fallbackData(1));
 
         (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
         (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
-        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
-        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
+        assertTrue(curPriceAfter != curPriceBefore, "cur price moved");
+        assertEq(fbPriceAfter, fbPriceBefore, "fb price unchanged");
     }
 
     function test_usesExplicitFb_oneForZero() public {
@@ -327,7 +330,7 @@ contract RingFallbackHookTest is Test {
         assertEq(IERC20(fewB).balanceOf(address(hook)), 0, "hook fewB balance");
     }
 
-    function test_emptyHookDataUsesCurWhenFbPriceIsBetter() public {
+    function test_autoRoutesToFbWhenSpotPriceBetter_zeroForOne() public {
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
@@ -340,16 +343,82 @@ contract RingFallbackHookTest is Test {
 
         (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
         (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
-        assertTrue(curPriceAfter != curPriceBefore, "cur price moved");
-        assertEq(fbPriceAfter, fbPriceBefore, "fb price unchanged");
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
-    function test_explicitFbRevertsWhenUnavailable() public {
+    function test_autoRoutesToFbWhenSpotPriceBetter_oneForZero() public {
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterOneForZero());
+        _addCurLiquidity(1e18);
+        _addFbLiquidity(FB_LIQUIDITY);
+
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
+        _swapAsUser(false, -int256(SWAP_AMOUNT));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
+    }
+
+    function test_autoRoutesToFbForExactOutput() public {
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
+        _addCurLiquidity(1e18);
+        _addFbLiquidity(FB_LIQUIDITY);
+
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
+        _swapAsUser(true, int256(SWAP_AMOUNT));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
+    }
+
+    function test_autoFbHookBalancesZero() public {
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
+        _addCurLiquidity(1e18);
+        _addFbLiquidity(FB_LIQUIDITY);
+
+        _swapAsUser(true, -int256(SWAP_AMOUNT));
+
+        assertEq(IERC20(address(tokenA)).balanceOf(address(hook)), 0, "hook tokenA balance");
+        assertEq(IERC20(address(tokenB)).balanceOf(address(hook)), 0, "hook tokenB balance");
+        assertEq(IERC20(fewA).balanceOf(address(hook)), 0, "hook fewA balance");
+        assertEq(IERC20(fewB).balanceOf(address(hook)), 0, "hook fewB balance");
+    }
+
+    function test_autoFbRevertsWhenWorseThanCurMarginal() public {
+        // fb spot price is better but liquidity is very shallow.
+        // The safety check should revert because fb's actual output will be
+        // worse than cur's marginal estimate.
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
+        _addCurLiquidity(1e18);
+        _addFbLiquidity(0.01e18);
+
+        vm.expectRevert();
+        _swapAsUser(true, -int256(SWAP_AMOUNT));
+    }
+
+    function test_usesCurWhenFbUnavailable_evenWithHookData() public {
+        // fb unavailable → cur is used regardless of hookData.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         _addCurLiquidity(1e18);
 
-        vm.expectRevert();
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+
         _swapAsUser(true, -int256(SWAP_AMOUNT), _fallbackData(1));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        assertTrue(curPriceAfter != curPriceBefore, "cur price moved");
     }
 
     function test_explicitFbRevertsWhenZeroLimit() public {
@@ -449,8 +518,11 @@ contract RingFallbackHookTest is Test {
     }
 
     function test_revertsOnInvalidHookData() public {
+        // Invalid hookData only reverts when fb is chosen (spot price better).
         manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
+        _addFbLiquidity(FB_LIQUIDITY);
 
         PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});

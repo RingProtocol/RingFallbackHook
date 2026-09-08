@@ -37,7 +37,7 @@ When changing routing, settlement, or delta accounting, add tests for both swap 
 
 ## Security Expectations
 
-- Do not select a fallback route solely because its marginal spot price is better unless the design explicitly documents and bounds the resulting execution-quality risk.
+- The hook always compares cur and fb marginal spot prices and routes to the better pool. `hookData` only controls slippage protection strength (cur-marginal safety check vs caller-supplied limit), not the routing decision.
 - Preserve user-controlled slippage or price-limit protections.
 - Require complete fills for fallback swaps, or revert the entire transaction.
 - Validate all external-call assumptions and avoid leaving token allowances or balances on the hook.

@@ -2,30 +2,29 @@
 
 ## What is RingFallbackHook?
 
-RingFallbackHook is a Uniswap v4 hook that exposes an origin-token current pool (cur pool) and a corresponding hookless FewToken fallback pool (fb pool) as explicitly selected routes. It does not compare pool spot prices and does not automatically choose the better route.
-
-An external off-chain quoter or router must calculate complete, trade-size-aware quotes for both routes and choose one:
+RingFallbackHook is a Uniswap v4 hook that automatically routes swaps to whichever pool has the better marginal spot price: the origin-token cur pool or the hookless FewToken fallback pool (fb pool). It always compares `sqrtPriceX96` and routes to fb when strictly better. Optional `hookData` provides stronger slippage protection when fb is chosen.
 
 ```
-Off-chain quoter compares cur and fb route results
+beforeSwap receives swap request
   |
-  +-- cur selected -> empty hookData -> normal cur pool swap
-  |                                    (FewToken not touched)
+  +-- compare cur and fb sqrtPriceX96
   |
-  +-- fb selected  -> abi.encode(deadline, amountLimit)
-                       -> take A -> wrap to fwA -> fb swap -> unwrap fwB -> settle B
-                       (cur pool swap is replaced with a no-op)
+  +-- fb strictly better and available?
+  |     YES -> execute fb
+  |           -> hookData empty? safety check vs cur marginal
+  |           -> hookData non-empty? check caller's (deadline, amountLimit)
+  |     NO  -> cur pool executes normally (hookData ignored)
 ```
 
 ## Key Concepts
 
 ### Cur Pool
 
-The "cur pool" is the Uniswap v4 pool that has RingFallbackHook attached. It trades origin tokens (for example, USDC/USDT) directly. Anyone can add liquidity to this pool; the hook does not restrict liquidity operations. Empty `hookData` always selects this route.
+The "cur pool" is the Uniswap v4 pool that has RingFallbackHook attached. It trades origin tokens (for example, USDC/USDT) directly. Anyone can add liquidity to this pool; the hook does not restrict liquidity operations. The cur pool is used when fb is unavailable or its spot price is not better.
 
 ### Fb Pool
 
-The "fb pool" is a hookless Uniswap v4 pool that trades the FewToken-wrapped versions of the same tokens (for example, fwUSDC/fwUSDT). The hook derives this pool's key at runtime from the cur pool's tokens and the FewFactory registry. Its fee and tick spacing match the cur pool. Non-empty, valid `hookData` explicitly requests this route.
+The "fb pool" is a hookless Uniswap v4 pool that trades the FewToken-wrapped versions of the same tokens (for example, fwUSDC/fwUSDT). The hook derives this pool's key at runtime from the cur pool's tokens and the FewFactory registry. Its fee and tick spacing match the cur pool. The hook routes to fb automatically when its spot price is strictly better than cur's.
 
 ### FewToken Wrapping
 
@@ -43,9 +42,9 @@ For an fb request, the hook uses Uniswap v4's flash mechanism:
 
 The PoolManager must already hold enough physical origin input for the conversion. Insufficient inventory reverts an explicit fb request; it does not redirect the request to cur.
 
-## Explicit Route Encoding
+## Route and Slippage Encoding
 
-### Cur Route
+### Default (empty hookData)
 
 Pass empty bytes:
 
@@ -53,9 +52,9 @@ Pass empty bytes:
 bytes memory hookData = "";
 ```
 
-The hook returns a zero delta and the cur pool executes normally. Because fb-specific `deadline` and `amountLimit` values are absent, this path relies on the router's and user's normal safeguards, such as `sqrtPriceLimitX96` and router-level deadlines or minimum-output/maximum-input constraints.
+The hook compares cur and fb marginal `sqrtPriceX96`. If fb is strictly better, it executes fb and verifies the actual result against cur's marginal estimate (a safety net that catches shallow-pool traps). If fb is not better or unavailable, the cur pool executes normally.
 
-### Fb Route
+### Optional Caller-Supplied Limits
 
 Pass exactly:
 
@@ -85,7 +84,7 @@ An explicit fb request reverts if any of the following occurs:
 - PoolManager origin-token inventory is insufficient;
 - strict wrapping, unwrapping, balance, or settlement checks fail.
 
-There is no graceful fallback to cur after the caller explicitly requests fb. Integrators that want the cur route must submit empty `hookData` as a separate transaction.
+There is no explicit "force fb" mode — the hook always picks the better pool by spot price. If fb is chosen but its liquidity is too shallow, the safety check (or caller's limit) reverts the transaction. The caller cannot override the routing decision via `hookData`; `hookData` only controls slippage protection strength when fb is chosen.
 
 ## BeforeSwapDelta
 
@@ -94,18 +93,26 @@ For an fb request, the hook uses `beforeSwapReturnDelta` to replace the cur pool
 - `specifiedDelta = -amountSpecified` sets `amountToSwap = 0` in the cur pool.
 - `unspecifiedDelta` is based on the actual fb output for exact-input or actual fb input for exact-output.
 
-For empty `hookData`, the hook returns a zero delta and the cur pool executes normally.
+For empty `hookData` where fb is not better or unavailable, the hook returns a zero delta and the cur pool executes normally. When fb is chosen (empty or non-empty `hookData`), the hook returns a `BeforeSwapDelta` that replaces the cur swap.
 
-## Off-Chain Quoting Requirement
+## Auto-Routing Safety Model
 
-Route selection belongs outside the hook. A production integration must quote both complete routes for the intended trade amount, including fees, liquidity depth, tick crossings, price impact, and transaction conditions. It should then:
+The hook always uses marginal `sqrtPriceX96` as the routing signal. This is the price for an infinitesimally small trade and does not account for trade size, liquidity depth, or tick crossings. To protect against shallow-pool traps, the hook performs a post-execution safety check when fb is chosen with empty `hookData`:
 
-1. choose cur or fb from those comparable quotes;
-2. retain the user's absolute price/slippage safeguards;
-3. for fb, derive a nonzero minimum output or maximum input and a short deadline;
-4. encode those values in `hookData` and ensure the router forwards it unchanged.
+- For exact-input: fb's actual output must be >= cur's marginal output for the same input.
+- For exact-output: fb's actual input must be <= cur's marginal input for the same output.
 
-The removed spot-price comparison did not account for trade size or liquidity distribution. Likewise, the removed fixed 10% exact-output input estimate was not a valid bound. Neither mechanism is part of the explicit-route design.
+If the safety check fails, the transaction reverts. This means fb only executes when it is definitively better than cur's best-case scenario. The check is conservative — it may revert in cases where fb is still competitive but does not beat cur's marginal rate. In such cases, the user can retry with `hookData` containing a caller-supplied limit that accepts the actual fb result.
+
+## Optional Caller-Supplied Limits
+
+For stronger slippage protection, the caller can encode `(deadline, amountLimit)` in `hookData`. When fb is chosen and `hookData` is non-empty, the caller's limit is enforced instead of the cur-marginal safety check:
+
+1. derive a nonzero minimum output or maximum input from a complete off-chain fb quote;
+2. set a short deadline;
+3. encode those values in `hookData` and ensure the router forwards it unchanged.
+
+If fb is not better by spot price, `hookData` is ignored and cur executes normally. The caller's limit only applies when fb is actually chosen.
 
 ## Hook Permissions
 
@@ -214,10 +221,11 @@ SwapParams memory params = SwapParams({
     sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
 });
 
-// Cur route:
+// Default: hook compares spot prices and picks the better pool.
+// If fb is chosen, cur's marginal estimate is used as the safety bound.
 poolManager.swap(curKey, params, "");
 
-// Fb route selected after external quote comparison:
+// Optional: stronger slippage protection when fb is chosen:
 poolManager.swap(curKey, params, abi.encode(block.timestamp + 5 minutes, minimumOutput));
 ```
 

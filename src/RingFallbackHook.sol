@@ -27,23 +27,26 @@ import {IFewFactory} from "./interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "./interfaces/external/IFewWrappedToken.sol";
 
 /// @title RingFallbackHook
-/// @notice A v4 hook that exposes an origin-token A/B pool (cur pool) and supports an explicitly
-///         requested route through the hookless fwA/fwB FewToken fallback pool (fb pool).
+/// @notice A v4 hook that routes swaps to whichever pool has more active liquidity: the origin-token
+///         cur pool or the hookless fwA/fwB FewToken fallback pool (fb pool).
 ///
 /// @dev Core logic:
-///      Empty hookData selects the cur pool. To select the fb pool, the caller supplies
-///      abi.encode(deadline, amountLimit), where amountLimit is the minimum output for exact-input
-///      swaps or maximum input for exact-output swaps. The hook derives the fb pool from FewFactory,
-///      executes the requested swap, enforces the limit against the actual result, and returns a
-///      BeforeSwapDelta that replaces the cur swap.
+///      The hook compares cur and fb active liquidity (getLiquidity) and routes to fb when it is
+///      strictly deeper. If fb is unavailable or not deeper, the cur pool executes normally.
+///      Since FewTokens are 1:1 wrappers with identical fee and tickSpacing, arbitrage keeps the two
+///      pool prices close; depth-based routing picks the pool that can absorb the trade with less
+///      price impact.
 ///
-///      An explicit fb request reverts if the route is unavailable, expired, underfilled, exceeds
-///      its amount limit, or lacks sufficient PoolManager inventory.
+///      Slippage protection relies on v4 native mechanisms:
+///      - sqrtPriceLimitX96 is mapped to the fb pool's price space before the fb swap.
+///      - The caller's router enforces deadline, amountOutMinimum, and amountInMaximum.
+///      - fb swaps must fill completely or the whole transaction reverts.
+///      hookData is ignored.
 ///
 ///      Safety model:
 ///      - no owner, upgrade, pause, fee, sweep, or route setter;
 ///      - anyone may add liquidity to the cur pool;
-///      - callers select routes using full off-chain quotes instead of manipulable marginal prices;
+///      - routing is always depth-based;
 ///      - the fb pool key is derived purely from the cur pool key and FewFactory state;
 ///      - wrap/unwrap are strict 1:1 with return-value and balance checks;
 ///      - exact-input and exact-output requests must fill completely or the whole transaction reverts;
@@ -71,12 +74,7 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     error TokenBalanceMismatch(address token, uint256 expectedBalance, uint256 actualBalance);
     error SettlementAmountMismatch(address token, uint256 paid, uint256 expected);
     error AmountOutOfRange(int256 amountSpecified);
-    error InvalidHookData();
-    error InvalidFallbackAmountLimit();
-    error FallbackRequestExpired(uint256 deadline, uint256 currentTimestamp);
     error FallbackRouteUnavailable();
-    error FallbackOutputTooLow(uint256 actual, uint256 minimum);
-    error FallbackInputTooHigh(uint256 actual, uint256 maximum);
 
     event FallbackSwap(
         PoolId indexed curPoolId,
@@ -117,7 +115,12 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         });
     }
 
-    function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
+    function _beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata /*hookData*/
+    )
         internal
         override
         nonReentrant
@@ -126,28 +129,19 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         _validateAmount(params.amountSpecified);
 
         PoolId curPoolId = key.toId();
-        if (hookData.length == 0) {
+
+        // Route to whichever pool has more active liquidity.
+        FbRoute memory route = _deriveFbRoute(key);
+        if (!route.available || !_isFbDeeper(route)) {
             emit FallbackSwap(curPoolId, PoolId.wrap(0), sender, params.zeroForOne, false, params.amountSpecified, 0, 0);
             return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
         }
-        if (hookData.length != 64) revert InvalidHookData();
 
-        (uint256 deadline, uint256 amountLimit) = abi.decode(hookData, (uint256, uint256));
-        if (block.timestamp > deadline) revert FallbackRequestExpired(deadline, block.timestamp);
-        if (amountLimit == 0) revert InvalidFallbackAmountLimit();
-
-        FbRoute memory route = _deriveFbRoute(key);
-        if (!route.available) revert FallbackRouteUnavailable();
-
+        // fb is deeper — execute fb. Slippage protection is provided by sqrtPriceLimitX96 (mapped to
+        // fb's price space) and the caller's router deadline/amount limits. hookData is ignored.
         bool fbZeroForOne = params.zeroForOne == route.orderAligned;
         (uint256 amountIn, uint256 amountOut) =
             _executeFbSwap(route, fbZeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
-
-        if (params.amountSpecified < 0) {
-            if (amountOut < amountLimit) revert FallbackOutputTooLow(amountOut, amountLimit);
-        } else if (amountIn > amountLimit) {
-            revert FallbackInputTooHigh(amountIn, amountLimit);
-        }
 
         address inputToken = params.zeroForOne ? route.token0 : route.token1;
         uint256 availableInput = IERC20(inputToken).balanceOf(address(poolManager));
@@ -181,6 +175,8 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         PoolId fbPoolId;
         bool orderAligned;
         bool available;
+        uint128 curLiquidity;
+        uint128 fbLiquidity;
     }
 
     function _deriveFbRoute(PoolKey calldata key) internal view returns (FbRoute memory route) {
@@ -211,50 +207,29 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         });
         PoolId fbPoolId = fbKey.toId();
 
-        (uint160 fbPrice,,,) = poolManager.getSlot0(fbPoolId);
-        if (fbPrice == 0) return _unavailableRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId);
-        if (poolManager.getLiquidity(fbPoolId) == 0) {
-            return _unavailableRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId);
+        uint128 fbLiquidity = poolManager.getLiquidity(fbPoolId);
+        if (fbLiquidity == 0) {
+            return _buildRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId, 0, 0, false);
         }
 
-        (uint160 curPrice,,,) = poolManager.getSlot0(key.toId());
-        if (curPrice == 0) return _unavailableRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId);
+        // The cur pool is guaranteed initialized: the hook is attached to it via PoolKey.hooks, and v4
+        // only routes swaps through initialized pools. No slot0 price check is needed.
+        uint128 curLiquidity = poolManager.getLiquidity(key.toId());
 
-        route = FbRoute({
-            token0: token0,
-            token1: token1,
-            few0: few0,
-            few1: few1,
-            fee: key.fee,
-            tickSpacing: key.tickSpacing,
-            fbPoolId: fbPoolId,
-            orderAligned: orderAligned,
-            available: true
-        });
+        route = _buildRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId, curLiquidity, fbLiquidity, true);
     }
 
-    function _emptyRoute(address token0, address token1, PoolKey calldata key) internal pure returns (FbRoute memory) {
-        return FbRoute({
-            token0: token0,
-            token1: token1,
-            few0: address(0),
-            few1: address(0),
-            fee: key.fee,
-            tickSpacing: key.tickSpacing,
-            fbPoolId: PoolId.wrap(0),
-            orderAligned: false,
-            available: false
-        });
-    }
-
-    function _unavailableRoute(
+    function _buildRoute(
         address token0,
         address token1,
         address few0,
         address few1,
         PoolKey calldata key,
         bool orderAligned,
-        PoolId fbPoolId
+        PoolId fbPoolId,
+        uint128 curLiquidity,
+        uint128 fbLiquidity,
+        bool available
     ) internal pure returns (FbRoute memory) {
         return FbRoute({
             token0: token0,
@@ -265,8 +240,25 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             tickSpacing: key.tickSpacing,
             fbPoolId: fbPoolId,
             orderAligned: orderAligned,
-            available: false
+            available: available,
+            curLiquidity: curLiquidity,
+            fbLiquidity: fbLiquidity
         });
+    }
+
+    function _emptyRoute(address token0, address token1, PoolKey calldata key) internal pure returns (FbRoute memory) {
+        return _buildRoute(token0, token1, address(0), address(0), key, false, PoolId.wrap(0), 0, 0, false);
+    }
+
+    // ---------------------------------------------------------------------
+    // depth comparison
+    // ---------------------------------------------------------------------
+
+    /// @dev Returns true when fb has strictly more active liquidity than cur. Liquidity is a scalar
+    ///      independent of token ordering, so no orderAligned inversion is needed. Equal liquidity
+    ///      routes to cur.
+    function _isFbDeeper(FbRoute memory route) internal pure returns (bool) {
+        return route.fbLiquidity > route.curLiquidity;
     }
 
     // ---------------------------------------------------------------------
