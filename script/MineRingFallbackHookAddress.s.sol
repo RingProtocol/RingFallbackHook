@@ -10,21 +10,25 @@ import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 
 import {RingFallbackHook} from "../src/RingFallbackHook.sol";
 import {IFewFactory} from "../src/interfaces/external/IFewFactory.sol";
+import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 /// @notice Read-only preflight and CREATE2 address mining for RingFallbackHook.
 ///
 /// Optional Ethereum defaults:
-///   V4_POOL_MANAGER, FEW_FACTORY
+///   V4_POOL_MANAGER, FEW_FACTORY, WETH9
 contract MineRingFallbackHookAddress is Script {
     address internal constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     address internal constant V4_POOL_MANAGER_DEFAULT = 0x000000000004444c5dc75cB358380D2e3dE08A90;
     address internal constant FEW_FACTORY_DEFAULT = 0x7D86394139bf1122E82FDF45Bb4e3b038A4464DD;
+    address internal constant WETH9_DEFAULT = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     function run() external view {
         address poolManagerAddress = vm.envOr("V4_POOL_MANAGER", V4_POOL_MANAGER_DEFAULT);
         address factoryAddress = vm.envOr("FEW_FACTORY", FEW_FACTORY_DEFAULT);
+        address wethAddress = vm.envOr("WETH9", WETH9_DEFAULT);
 
-        bytes memory constructorArgs = abi.encode(IPoolManager(poolManagerAddress), IFewFactory(factoryAddress));
+        bytes memory constructorArgs =
+            abi.encode(IPoolManager(poolManagerAddress), IFewFactory(factoryAddress), IWETH9(wethAddress));
         uint160 flags = _flags();
         (address expectedHook, bytes32 salt) =
             HookMiner.find(CREATE2_DEPLOYER, flags, type(RingFallbackHook).creationCode, constructorArgs);
@@ -32,6 +36,7 @@ contract MineRingFallbackHookAddress is Script {
         console2.log("=== RingFallbackHook preflight ===");
         console2.log("poolManager:  ", poolManagerAddress);
         console2.log("fewFactory:   ", factoryAddress);
+        console2.log("weth9:        ", wethAddress);
         console2.log("permission mask:", flags);
         console2.log("HOOK_SALT:");
         console2.logBytes32(salt);

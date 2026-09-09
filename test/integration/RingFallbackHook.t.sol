@@ -10,6 +10,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -26,8 +27,10 @@ import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 import {RingFallbackHook} from "../../src/RingFallbackHook.sol";
 import {IFewFactory} from "../../src/interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "../../src/interfaces/external/IFewWrappedToken.sol";
+import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 import {MockFewFactory} from "../mocks/MockFewFactory.sol";
+import {MockWETH9} from "../mocks/MockWETH9.sol";
 
 /// @notice Integration tests for RingFallbackHook using a fresh local PoolManager and mock FewFactory.
 contract RingFallbackHookTest is Test {
@@ -49,6 +52,7 @@ contract RingFallbackHookTest is Test {
     PoolModifyLiquidityTest internal liquidityRouter;
 
     MockFewFactory internal factory;
+    MockWETH9 internal weth;
     RingFallbackHook internal hook;
 
     MockERC20 internal tokenA;
@@ -93,6 +97,9 @@ contract RingFallbackHookTest is Test {
         fewA = factory.getWrappedToken(address(tokenA));
         fewB = factory.getWrappedToken(address(tokenB));
 
+        // Deploy mock WETH9 for native ETH support tests.
+        weth = new MockWETH9();
+
         // Mint underlying to PoolManager so the hook can flash-take during fb route.
         // Also mint fewTokens to PoolManager for the fb swap output leg.
         tokenA.mint(address(manager), 1_000_000e18);
@@ -100,10 +107,10 @@ contract RingFallbackHookTest is Test {
 
         // Deploy the hook at a mined address matching permission flags.
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
-        bytes memory constructorArgs = abi.encode(manager, IFewFactory(address(factory)));
+        bytes memory constructorArgs = abi.encode(manager, IFewFactory(address(factory)), IWETH9(address(weth)));
         (address minedAddr, bytes32 salt) =
             HookMiner.find(address(this), flags, type(RingFallbackHook).creationCode, constructorArgs);
-        hook = new RingFallbackHook{salt: salt}(manager, IFewFactory(address(factory)));
+        hook = new RingFallbackHook{salt: salt}(manager, IFewFactory(address(factory)), IWETH9(address(weth)));
         assertEq(address(hook), minedAddr, "hook address mismatch");
 
         // Approve tokens for routers.
@@ -167,17 +174,26 @@ contract RingFallbackHookTest is Test {
     }
 
     function test_constructor_zeroAddress_reverts() public {
-        // FewFactory(0) is blocked by the constructor.
+        // FewFactory(0) and WETH(0) are blocked by the constructor.
         // We can't test PoolManager(0) directly because BaseHook's validateHookAddress
         // runs first and requires a specific address pattern.
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
-        bytes memory constructorArgs = abi.encode(manager, IFewFactory(address(0)));
-        (address minedAddr, bytes32 salt) =
-            HookMiner.find(address(this), flags, type(RingFallbackHook).creationCode, constructorArgs);
+
+        // FewFactory(0)
+        bytes memory constructorArgsA = abi.encode(manager, IFewFactory(address(0)), IWETH9(address(weth)));
+        (address minedAddrA, bytes32 saltA) =
+            HookMiner.find(address(this), flags, type(RingFallbackHook).creationCode, constructorArgsA);
         vm.expectRevert(RingFallbackHook.ZeroAddress.selector);
-        new RingFallbackHook{salt: salt}(manager, IFewFactory(address(0)));
-        // Suppress unused warning.
-        minedAddr;
+        new RingFallbackHook{salt: saltA}(manager, IFewFactory(address(0)), IWETH9(address(weth)));
+        minedAddrA;
+
+        // WETH(0)
+        bytes memory constructorArgsB = abi.encode(manager, IFewFactory(address(factory)), IWETH9(address(0)));
+        (address minedAddrB, bytes32 saltB) =
+            HookMiner.find(address(this), flags, type(RingFallbackHook).creationCode, constructorArgsB);
+        vm.expectRevert(RingFallbackHook.ZeroAddress.selector);
+        new RingFallbackHook{salt: saltB}(manager, IFewFactory(address(factory)), IWETH9(address(0)));
+        minedAddrB;
     }
 
     // ---------------------------------------------------------------------
@@ -235,12 +251,12 @@ contract RingFallbackHookTest is Test {
         assertTrue(curPriceAfter != SQRT_PRICE_1_1, "cur price moved");
     }
 
-    function test_emptyHookDataUsesCurWhenFbPriceIsEqual() public {
-        // Both pools initialized at same price -> fb is not strictly better.
+    function test_emptyHookDataUsesCurWhenFbLiquidityEqual() public {
+        // Both pools at the same price with equal liquidity -> equal depth routes to cur.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, SQRT_PRICE_1_1);
         _addCurLiquidity(1e18);
-        _addFbLiquidity(FB_LIQUIDITY);
+        _addFbLiquidity(1e18);
 
         _swapAsUser(true, -int256(SWAP_AMOUNT));
 
@@ -276,9 +292,29 @@ contract RingFallbackHookTest is Test {
         assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
     }
 
-    function test_usesCurWhenFbSpotPriceWorse_evenWithHookData() public {
-        // fb spot price is worse → cur is used regardless of hookData.
-        // Set fb price to the "better for oneForZero" value, but swap zeroForOne.
+    function test_usesCurWhenFbShallower_evenWithHookData() public {
+        // fb price is better for zeroForOne, but fb liquidity is shallower than cur ->
+        // depth-based routing selects cur regardless of hookData.
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
+        _addCurLiquidity(1e18);
+        _addFbLiquidity(0.5e18);
+
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
+        _swapAsUser(true, -int256(SWAP_AMOUNT / 1000), _fallbackData(1));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertTrue(curPriceAfter != curPriceBefore, "cur price moved");
+        assertEq(fbPriceAfter, fbPriceBefore, "fb price unchanged");
+    }
+
+    function test_routesToFbWhenDeeperEvenIfPriceWorse() public {
+        // Depth-based routing: fb price is worse for zeroForOne, but fb is strictly deeper ->
+        // fb is still used. The fb price sits near the edge of the fb liquidity range in the swap's
+        // direction, so use a small amount that still fills completely.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterOneForZero());
         _addCurLiquidity(1e18);
@@ -287,13 +323,12 @@ contract RingFallbackHookTest is Test {
         (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
         (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
 
-        // zeroForOne swap: fb price is set for better oneForZero, so fb is worse for zeroForOne.
-        _swapAsUser(true, -int256(SWAP_AMOUNT / 1000), _fallbackData(1));
+        _swapAsUser(true, -int256(SWAP_AMOUNT / 1000));
 
         (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
         (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
-        assertTrue(curPriceAfter != curPriceBefore, "cur price moved");
-        assertEq(fbPriceAfter, fbPriceBefore, "fb price unchanged");
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
     function test_usesExplicitFb_oneForZero() public {
@@ -395,17 +430,40 @@ contract RingFallbackHookTest is Test {
         assertEq(IERC20(fewB).balanceOf(address(hook)), 0, "hook fewB balance");
     }
 
-    function test_autoFbRevertsWhenWorseThanCurMarginal() public {
-        // fb spot price is better but liquidity is very shallow.
-        // The safety check should revert because fb's actual output will be
-        // worse than cur's marginal estimate.
+    function test_fbDeeperButTooShallowRevertsOnPartialFill() public {
+        // fb is strictly deeper than cur but still too shallow for the requested amount.
+        // The fb swap cannot fill completely, so the whole transaction reverts.
         manager.initialize(curKey, SQRT_PRICE_1_1);
-        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
-        _addCurLiquidity(1e18);
+        manager.initialize(fbKey, SQRT_PRICE_1_1);
+        _addCurLiquidity(0.001e18);
         _addFbLiquidity(0.01e18);
 
-        vm.expectRevert();
-        _swapAsUser(true, -int256(SWAP_AMOUNT));
+        // v4-core wraps hook reverts in the ERC-7751 error WrappedError(address,bytes4,bytes,bytes)
+        // (see Hooks.callHook), so vm.expectRevert(FbSwapPartialFill.selector) cannot match directly.
+        // Catch the wrapper, decode it, and assert the inner reason is FbSwapPartialFill.
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        try swapRouter.swap(
+            curKey,
+            SwapParams({
+                zeroForOne: true, amountSpecified: -int256(SWAP_AMOUNT), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            settings,
+            bytes("")
+        ) {
+            assertTrue(false, "expected FbSwapPartialFill");
+        } catch (bytes memory reason) {
+            assertEq(bytes4(reason), CustomRevert.WrappedError.selector, "ERC-7751 wrapper");
+            (address target, bytes4 fnSelector, bytes memory inner,) =
+                abi.decode(_stripSelector(reason), (address, bytes4, bytes, bytes));
+            assertEq(target, address(hook), "wrapper target");
+            assertEq(fnSelector, IHooks.beforeSwap.selector, "wrapper selector");
+            assertEq(bytes4(inner), RingFallbackHook.FbSwapPartialFill.selector, "FbSwapPartialFill");
+            (uint256 actual, uint256 expected) = abi.decode(_stripSelector(inner), (uint256, uint256));
+            assertEq(expected, SWAP_AMOUNT, "expected fill");
+            assertTrue(actual < expected, "partial fill");
+        }
     }
 
     function test_usesCurWhenFbUnavailable_evenWithHookData() public {
@@ -421,35 +479,59 @@ contract RingFallbackHookTest is Test {
         assertTrue(curPriceAfter != curPriceBefore, "cur price moved");
     }
 
-    function test_explicitFbRevertsWhenZeroLimit() public {
+    function test_hookDataIgnored_zeroLimitStillRoutesToFb() public {
+        // hookData carries no amountLimit semantics; routing is purely depth-based.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
         _addFbLiquidity(FB_LIQUIDITY);
 
-        vm.expectRevert();
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
         _swapAsUser(true, -int256(SWAP_AMOUNT), _fallbackData(0));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
-    function test_explicitFbRevertsWhenExpired() public {
+    function test_hookDataIgnored_expiredDeadlineStillRoutesToFb() public {
+        // hookData carries no deadline semantics; an expired encoding no longer reverts.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
         _addFbLiquidity(FB_LIQUIDITY);
         vm.warp(100);
 
-        vm.expectRevert();
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
         _swapAsUser(true, -int256(SWAP_AMOUNT), abi.encode(uint256(99), uint256(1)));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
-    function test_explicitFbRevertsWhenMinimumOutputNotMet() public {
+    function test_hookDataIgnored_minOutputNotEnforced() public {
+        // hookData carries no minimum-output semantics; a huge limit no longer reverts.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
         _addFbLiquidity(FB_LIQUIDITY);
 
-        vm.expectRevert();
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
         _swapAsUser(true, -int256(SWAP_AMOUNT), _fallbackData(type(uint256).max));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
     function test_usesExplicitFbForExactOutput() public {
@@ -486,14 +568,22 @@ contract RingFallbackHookTest is Test {
         assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
-    function test_explicitFbRevertsWhenMaximumInputExceeded() public {
+    function test_hookDataIgnored_maxInputNotEnforced() public {
+        // hookData carries no maximum-input semantics; a tiny limit no longer reverts.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterOneForZero());
         _addCurLiquidity(1e18);
         _addFbLiquidity(FB_LIQUIDITY);
 
-        vm.expectRevert();
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
         _swapAsUser(false, int256(SWAP_AMOUNT), _fallbackData(1));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
     // ---------------------------------------------------------------------
@@ -517,30 +607,37 @@ contract RingFallbackHookTest is Test {
         );
     }
 
-    function test_revertsOnInvalidHookData() public {
-        // Invalid hookData only reverts when fb is chosen (spot price better).
+    function test_hookDataIgnored_invalidBytesStillSwaps() public {
+        // hookData is not validated; arbitrary bytes neither revert nor change routing.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
         _addFbLiquidity(FB_LIQUIDITY);
 
-        PoolSwapTest.TestSettings memory settings =
-            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
 
-        vm.expectRevert();
-        swapRouter.swap(
-            curKey,
-            SwapParams({
-                zeroForOne: true, amountSpecified: -int256(SWAP_AMOUNT), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-            }),
-            settings,
-            bytes("invalid")
-        );
+        _swapAsUser(true, -int256(SWAP_AMOUNT), bytes("invalid"));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
+
+    /// @dev Returns `data` without its leading 4-byte selector, so abi.decode can consume a
+    ///      custom-error payload.
+    function _stripSelector(bytes memory data) internal pure returns (bytes memory) {
+        bytes memory out = new bytes(data.length - 4);
+        for (uint256 i = 0; i < out.length; ++i) {
+            out[i] = data[i + 4];
+        }
+        return out;
+    }
 
     function _addCurLiquidity(uint256 liquidityAmount) internal {
         ModifyLiquidityParams memory params = ModifyLiquidityParams({

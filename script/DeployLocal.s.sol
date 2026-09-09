@@ -26,8 +26,10 @@ import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {RingFallbackHook} from "../src/RingFallbackHook.sol";
 import {IFewFactory} from "../src/interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "../src/interfaces/external/IFewWrappedToken.sol";
+import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 import {MockFewFactory} from "../test/mocks/MockFewFactory.sol";
+import {MockWETH9} from "../test/mocks/MockWETH9.sol";
 
 /// @notice Full local deployment script for testing on anvil.
 ///         Deploys everything from scratch: PoolManager, mock tokens, mock FewFactory,
@@ -92,12 +94,15 @@ contract DeployLocal is Script {
         // 6. Mine hook address and deploy via CREATE2
         //    forge script uses the standard CREATE2 deployer (0x4e59b4...) for new{salt} deployments.
         address create2Deployer = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        MockWETH9 weth = new MockWETH9();
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
-        bytes memory constructorArgs = abi.encode(IPoolManager(address(manager)), IFewFactory(address(factory)));
+        bytes memory constructorArgs =
+            abi.encode(IPoolManager(address(manager)), IFewFactory(address(factory)), IWETH9(address(weth)));
         (address expectedHook, bytes32 salt) =
             HookMiner.find(create2Deployer, flags, type(RingFallbackHook).creationCode, constructorArgs);
-        RingFallbackHook hook =
-            new RingFallbackHook{salt: salt}(IPoolManager(address(manager)), IFewFactory(address(factory)));
+        RingFallbackHook hook = new RingFallbackHook{salt: salt}(
+            IPoolManager(address(manager)), IFewFactory(address(factory)), IWETH9(address(weth))
+        );
         require(address(hook) == expectedHook, "hook address mismatch");
         console2.log("RingFallbackHook:", address(hook));
 

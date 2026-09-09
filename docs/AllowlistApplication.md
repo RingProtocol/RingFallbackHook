@@ -36,32 +36,27 @@ The hook must not allow reentrancy that could manipulate pool state. RingFallbac
 - Does not call back into the same pool during fallback execution
 - Uses a hookless fb pool (`IHooks(address(0))`), so there are no nested hook calls
 
-### 3. Validated Route Input
+### 3. No User-Controlled Route Input
 
-The hook accepts only two input forms:
-
-- Empty `hookData`, which always selects the cur pool
-- A 64-byte `abi.encode(uint256 deadline, uint256 amountLimit)`, which explicitly requests the fb pool
-
-For an fb request, the hook rejects expired deadlines and zero limits. `amountLimit` is the minimum output for exact-input and the maximum input for exact-output. No pool address or arbitrary call target is supplied by the user; the fallback key and wrappers remain derived from the cur pool key and FewFactory state.
+The hook accepts no user-supplied routing instructions. `hookData` is ignored entirely — the routing decision is computed on chain by comparing cur and fb active liquidity (`getLiquidity`), and the fallback pool key is derived purely from the cur pool key and FewFactory state. No pool address, arbitrary call target, deadline, or amount limit is supplied by the user.
 
 ### 4. Delta Accounting Correctness
 
-Since the hook uses `beforeSwapReturnDelta`, the returned delta must be correct. For an explicit fb request, RingFallbackHook:
+Since the hook uses `beforeSwapReturnDelta`, the returned delta must be correct. When the fb route is chosen, RingFallbackHook:
 
 - Sets `specifiedDelta = -amountSpecified` to zero out the cur pool swap
 - Sets `unspecifiedDelta` from the actual fb output (exact-input) or actual fb input (exact-output)
 - Uses values from real fb execution, not estimates
 - Enforces complete fill; a partial fill reverts (`FbSwapPartialFill`)
-- Enforces the caller's limit against the actual result
+- Maps the caller's `sqrtPriceLimitX96` into the fb pool's price space (with inversion when token order differs), so the caller's price limit stays effective on the fb route
 
-Empty `hookData` returns a zero delta and lets the cur pool execute normally.
+When fb is not chosen, the hook returns a zero delta and the cur pool executes normally.
 
-### 5. Explicit Failure Semantics
+### 5. Deterministic Routing and Explicit Failure Semantics
 
-There is no automatic or graceful route substitution. Empty `hookData` uses cur. A non-empty request explicitly chooses fb and reverts if its encoding is invalid, its deadline or limit fails, the fallback route is unavailable, PoolManager inventory is insufficient, or execution checks fail. This preserves caller intent and prevents an explicit fallback quote from silently executing on a different route.
+Routing is deterministic and fully on-chain: the hook routes to fb only when the fallback pool is available (wrappers registered and verified, fb pool initialized with liquidity, static fee, ERC-20 currencies) and strictly deeper than cur; otherwise the cur pool executes with the caller's original parameters. There is no silent route substitution at execution time and no partial-fill mode: an fb-routed swap reverts if the fb swap cannot fill completely, PoolManager inventory is insufficient, or wrap/unwrap/balance/settlement checks fail.
 
-An external off-chain quoter or router is required to compare complete cur and fb quotes before selecting `hookData`. The hook does not compare marginal spot prices or promise best execution. For the cur path, standard router/user safeguards remain responsible for deadlines and minimum-output/maximum-input protection in addition to `sqrtPriceLimitX96`.
+Because `hookData` is ignored, callers protect themselves with the same v4-native mechanisms used for direct swaps: `sqrtPriceLimitX96` (honored on both routes) plus router-level deadline and minimum-output/maximum-input checks.
 
 ### 6. Source Code Verification
 
@@ -80,19 +75,31 @@ RingFallbackHook
 ### Hook description
 
 ```
-RingFallbackHook is a Uniswap v4 hook exposing two explicitly selected routes for origin-token pools. Empty hookData always executes through the attached current pool. A validated abi.encode(deadline, amountLimit) request selects the corresponding hookless FewToken fallback pool and performs strict 1:1 flash wrap/swap/unwrap settlement. The limit is checked against the actual fallback result. An external off-chain quoter must compare complete route quotes before selection; the hook performs no spot-price auto-routing. Explicit fallback requests revert rather than silently changing routes. The hook has no admin functions, upgradeability, or ability to withdraw user funds.
+RingFallbackHook is a Uniswap v4 hook that automatically routes swaps between the attached origin-token pool (cur) and the corresponding hookless FewToken fallback pool (fb). Routing is fully on-chain and deterministic: the hook compares the two pools' active liquidity via getLiquidity and executes on fb only when it is strictly deeper, using strict 1:1 flash wrap/swap/unwrap settlement inside the swap callback. The caller's sqrtPriceLimitX96 is mapped into the fb pool's price space so price-limit protection remains effective. hookData is ignored; there are no user-supplied routes, addresses, or limits. fb swaps must fill completely or the whole transaction reverts. The hook has no admin functions, upgradeability, or ability to withdraw user funds.
 ```
 
 ### Hook address
 
 ```
-[Fill in after deployment]
+0x5803991b45EA694914FB4806b86b962563a50088
 ```
+
+Deployed on Ethereum mainnet via CREATE2 (salt `0x0000000000000000000000000000000000000000000000000000000000001881`).
+Permission mask: `0x88` (`BEFORE_SWAP_FLAG | BEFORE_SWAP_RETURNS_DELTA_FLAG`).
+Deployment tx: `0xc797f371b0bc1e9b72560a112cd6fbe56f7767dc2cd16f8906518724365dd9d8` (block 25933038).
+Source verified on Etherscan: https://etherscan.io/address/0x5803991b45EA694914FB4806b86b962563a50088
+
+Constructor args (ABI-encoded):
+```
+0x000000000000000000000000000000000004444c5dc75cb358380d2e3de08a900000000000000000000000007d86394139bf1122e82fdf45bb4e3b038a4464dd
+```
+- `poolManager`: `0x000000000004444c5dc75cB358380D2e3dE08A90`
+- `fewFactory`: `0x7D86394139bf1122E82FDF45Bb4e3b038A4464DD`
 
 ### Pool ID / address
 
 ```
-[Fill in after deploying a test pool with liquidity]
+[Fill in after initializing a cur pool with the hook on Uniswap v4 frontend]
 ```
 
 ### Hook details
@@ -135,14 +142,14 @@ https://github.com/ringprotocol/RingFallbackHook
 
 Before submitting the allowlist application, ensure the following are complete:
 
-- [ ] Hook deployed on target chain with correct permission flags (`0x88`)
-- [ ] Source code verified on block explorer (Etherscan / equivalent)
+- [x] Hook deployed on target chain with correct permission flags (`0x88`)
+- [x] Source code verified on block explorer (Etherscan / equivalent)
 - [ ] At least one pool initialized with the hook and containing minimal liquidity
 - [ ] Cur and fb route swaps tested on-chain in both directions
-- [ ] Exact-input and exact-output fb limits tested against actual results
-- [ ] Invalid, expired, unavailable, insufficient-inventory, and limit-failure requests confirmed to revert
+- [ ] Exact-input and exact-output fb swaps tested, including complete-fill enforcement
+- [ ] `sqrtPriceLimitX96` mapping verified on the fb route (both token orderings)
+- [ ] Unavailable, insufficient-inventory, and partial-fill requests confirmed to revert
 - [ ] Hook balances confirmed zero after successful fallback swaps
-- [ ] Off-chain quoter integration compares full route results and forwards `hookData` unchanged
 - [ ] Cur-route router/user deadline and slippage safeguards verified
 - [ ] Security review completed (see below)
 - [ ] GitHub repository public with matching source code
@@ -157,23 +164,23 @@ Based on the [Uniswap v4 Security Framework](https://developers.uniswap.org/docs
 | Dimension | Score | Notes |
 |-----------|-------|-------|
 | Hook complexity | Low | Only `beforeSwap` + `beforeSwapReturnDelta`, no other callbacks |
-| Math complexity | Low | No custom curves or on-chain route-comparison math; actual-result limit checks only |
-| External dependencies | Medium | Depends on PoolManager, FewFactory, FewWrappedToken, and external quote quality |
+| Math complexity | Low | Liquidity-depth comparison and sqrt-price-limit mapping; actual-result delta checks only |
+| External dependencies | Medium | Depends on PoolManager, FewFactory, and FewWrappedToken |
 | Token handling | Medium | Wrap/unwrap with balance checks; flash-take from PoolManager |
 | Upgradeability | None | No proxy, no owner, immutable constructor arguments |
 | Governance | None | No governance, admin, or pausable functions |
 | Liquidity behavior | Low | Does not modify or block liquidity operations |
 | Reentrancy surface | Low | `ReentrancyGuard` + hookless fb pool |
-| Oracle dependency | None | No on-chain external oracle; routing requires off-chain quotes |
+| Oracle dependency | None | No on-chain external oracle; routing uses pool liquidity directly |
 
 ### Recommended Security Actions
 
 1. **External audit**: obtain at least one independent security audit before mainnet deployment.
 2. **FewFactory integration review**: verify the FewFactory and FewWrappedToken contracts are audited and trusted.
-3. **Quoter review**: verify full-route comparison, deadline/limit derivation, and correct exact-input/exact-output encoding.
+3. **Price-limit mapping review**: verify `sqrtPriceLimitX96` inversion and clamping for both token orderings of the fb pool.
 4. **Edge case testing**: test with fee-on-transfer tokens, rebasing tokens, and tokens with transfer hooks.
 5. **Fork testing**: run the fork test suite against mainnet state to verify real pool interactions.
-6. **Monitoring**: monitor `FallbackSwap`, fallback-request reverts, PoolManager inventory, and fb liquidity.
+6. **Monitoring**: monitor `FallbackSwap`, fb-route reverts, PoolManager inventory, and fb liquidity.
 
 ## Submission Process
 
@@ -190,4 +197,4 @@ If the hook is not allowlisted for classic routing, it can still be supported vi
 
 > UniswapX is able to support any pools including those that use `beforeSwap`, `afterSwap` and custom fee tiers. Developers of these hooks can run their own fillers to participate in Uniswap Labs interface routing.
 
-To support RingFallbackHook via UniswapX, a filler would need to quote both routes, encode the selected request correctly, and execute swaps through the hook's pools. This is an alternative path if the classic routing allowlist is not obtained.
+To support RingFallbackHook via UniswapX, a filler would quote the swap through the hook's pools (the hook routes between cur and fb on chain) and execute swaps with appropriate price-limit protection. This is an alternative path if the classic routing allowlist is not obtained.

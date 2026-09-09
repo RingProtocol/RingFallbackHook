@@ -22,6 +22,7 @@ import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 import {RingFallbackHook} from "../../src/RingFallbackHook.sol";
 import {IFewFactory} from "../../src/interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "../../src/interfaces/external/IFewWrappedToken.sol";
+import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 /// @dev The v4-core PoolSwapTest helper ABI-decodes ERC20 return values and therefore cannot settle
 ///      legacy USDT. This router uses SafeERC20, matching production-router token compatibility.
@@ -79,6 +80,7 @@ contract RingFallbackHookForkTest is Test {
     uint256 internal constant FORK_BLOCK = 25_833_244;
     address internal constant V4_POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
     address internal constant FEW_FACTORY = 0x7D86394139bf1122E82FDF45Bb4e3b038A4464DD;
+    address internal constant WETH9 = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
     address internal constant FW_USDC = 0x0492560FA7Cfd6A85E50D8bE3F77318994F8f429;
@@ -116,10 +118,10 @@ contract RingFallbackHookForkTest is Test {
 
         // Deploy hook at mined address.
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
-        bytes memory constructorArgs = abi.encode(manager, IFewFactory(FEW_FACTORY));
+        bytes memory constructorArgs = abi.encode(manager, IFewFactory(FEW_FACTORY), IWETH9(WETH9));
         (address minedAddr, bytes32 salt) =
             HookMiner.find(address(this), flags, type(RingFallbackHook).creationCode, constructorArgs);
-        hook = new RingFallbackHook{salt: salt}(manager, IFewFactory(FEW_FACTORY));
+        hook = new RingFallbackHook{salt: salt}(manager, IFewFactory(FEW_FACTORY), IWETH9(WETH9));
         assertEq(address(hook), minedAddr);
 
         // Construct cur pool key (USDC < USDT).

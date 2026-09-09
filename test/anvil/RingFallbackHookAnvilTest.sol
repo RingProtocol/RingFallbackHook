@@ -24,8 +24,10 @@ import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 import {RingFallbackHook} from "../../src/RingFallbackHook.sol";
 import {IFewFactory} from "../../src/interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "../../src/interfaces/external/IFewWrappedToken.sol";
+import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 import {MockFewFactory} from "../mocks/MockFewFactory.sol";
+import {MockWETH9} from "../mocks/MockWETH9.sol";
 
 /// @notice Tests run against a live anvil mainnet fork (default http://127.0.0.1:8545).
 ///         Scenario required by the audit walkthrough:
@@ -148,11 +150,12 @@ contract RingFallbackHookAnvilTest is Test {
         assertFalse(few0 < few1, "orderAligned must be false");
 
         // Deploy the hook at a mined address matching the 0x88 permission mask.
+        MockWETH9 weth = new MockWETH9();
         uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
-        bytes memory constructorArgs = abi.encode(manager, IFewFactory(address(factory)));
+        bytes memory constructorArgs = abi.encode(manager, IFewFactory(address(factory)), IWETH9(address(weth)));
         (address minedAddr, bytes32 salt) =
             HookMiner.find(address(this), flags, type(RingFallbackHook).creationCode, constructorArgs);
-        hook = new RingFallbackHook{salt: salt}(manager, IFewFactory(address(factory)));
+        hook = new RingFallbackHook{salt: salt}(manager, IFewFactory(address(factory)), IWETH9(address(weth)));
         assertEq(address(hook), minedAddr, "hook address mismatch");
 
         // cur pool trades origin tokens; fb pool trades the wrapped tokens with flipped order.

@@ -2,29 +2,33 @@
 
 ## What is RingFallbackHook?
 
-RingFallbackHook is a Uniswap v4 hook that automatically routes swaps to whichever pool has the better marginal spot price: the origin-token cur pool or the hookless FewToken fallback pool (fb pool). It always compares `sqrtPriceX96` and routes to fb when strictly better. Optional `hookData` provides stronger slippage protection when fb is chosen.
+RingFallbackHook is a Uniswap v4 hook that routes swaps to whichever pool has more active liquidity: the origin-token cur pool or the hookless FewToken fallback pool (fb pool). It compares the two pools' in-range liquidity (`getLiquidity`) and routes to fb when it is strictly deeper. `hookData` is ignored — routing is always depth-based.
 
 ```
 beforeSwap receives swap request
   |
-  +-- compare cur and fb sqrtPriceX96
+  +-- derive fb route from cur pool key + FewFactory
   |
-  +-- fb strictly better and available?
-  |     YES -> execute fb
-  |           -> hookData empty? safety check vs cur marginal
-  |           -> hookData non-empty? check caller's (deadline, amountLimit)
-  |     NO  -> cur pool executes normally (hookData ignored)
+  +-- fb available and strictly deeper than cur?
+  |     YES -> execute fb (flash wrap -> fb swap -> unwrap -> settle)
+  |           -> sqrtPriceLimitX96 mapped into fb's price space
+  |           -> swap must fill completely or the whole tx reverts
+  |     NO  -> cur pool executes normally
 ```
 
 ## Key Concepts
 
 ### Cur Pool
 
-The "cur pool" is the Uniswap v4 pool that has RingFallbackHook attached. It trades origin tokens (for example, USDC/USDT) directly. Anyone can add liquidity to this pool; the hook does not restrict liquidity operations. The cur pool is used when fb is unavailable or its spot price is not better.
+The "cur pool" is the Uniswap v4 pool that has RingFallbackHook attached. It trades origin tokens (for example, USDC/USDT) directly. Anyone can add liquidity to this pool; the hook does not restrict liquidity operations. The cur pool is used when fb is unavailable or not strictly deeper.
 
 ### Fb Pool
 
-The "fb pool" is a hookless Uniswap v4 pool that trades the FewToken-wrapped versions of the same tokens (for example, fwUSDC/fwUSDT). The hook derives this pool's key at runtime from the cur pool's tokens and the FewFactory registry. Its fee and tick spacing match the cur pool. The hook routes to fb automatically when its spot price is strictly better than cur's.
+The "fb pool" is a hookless Uniswap v4 pool that trades the FewToken-wrapped versions of the same tokens (for example, fwUSDC/fwUSDT). The hook derives this pool's key at runtime from the cur pool's tokens and the FewFactory registry. Its fee and tick spacing match the cur pool. The hook routes to fb automatically when its active liquidity is strictly greater than cur's.
+
+### Depth-Based Routing
+
+The hook compares the two pools' active (in-range) liquidity via `poolManager.getLiquidity` and routes to fb when `fbLiquidity > curLiquidity`. Equal liquidity routes to cur. Since FewTokens are 1:1 wrappers and the fb pool shares the cur pool's fee and tick spacing, arbitrage keeps the two prices close; the deeper pool absorbs a given trade with less price impact. Note that liquidity depth is the routing signal, not marginal spot price — a deeper fb pool is chosen even if its marginal price is momentarily worse.
 
 ### FewToken Wrapping
 
@@ -32,7 +36,7 @@ FewTokens (fwA, fwB) are 1:1 wrapped representations of origin tokens. The `FewF
 
 ### Flash Conversion
 
-For an fb request, the hook uses Uniswap v4's flash mechanism:
+For an fb-routed swap, the hook uses Uniswap v4's flash mechanism:
 
 1. **Take** the origin input token from the PoolManager's global balance.
 2. **Wrap** it to the corresponding FewToken.
@@ -40,85 +44,54 @@ For an fb request, the hook uses Uniswap v4's flash mechanism:
 4. **Unwrap** the output FewToken back to the origin token.
 5. **Settle** the origin output back to the PoolManager.
 
-The PoolManager must already hold enough physical origin input for the conversion. Insufficient inventory reverts an explicit fb request; it does not redirect the request to cur.
+The PoolManager must already hold enough physical origin input for the conversion. Insufficient inventory reverts the swap; it does not redirect the request to cur.
 
-## Route and Slippage Encoding
+## Routing and Slippage Protection
 
-### Default (empty hookData)
+`hookData` is ignored entirely. Slippage protection relies on v4's native mechanisms:
 
-Pass empty bytes:
-
-```solidity
-bytes memory hookData = "";
-```
-
-The hook compares cur and fb marginal `sqrtPriceX96`. If fb is strictly better, it executes fb and verifies the actual result against cur's marginal estimate (a safety net that catches shallow-pool traps). If fb is not better or unavailable, the cur pool executes normally.
-
-### Optional Caller-Supplied Limits
-
-Pass exactly:
-
-```solidity
-bytes memory hookData = abi.encode(uint256(deadline), uint256(amountLimit));
-```
-
-The encoding is 64 bytes. `deadline` is the last valid timestamp for the request, and `amountLimit` must be nonzero.
-
-| Swap type | `amountSpecified` | `amountLimit` means | Enforced against |
-|---|---:|---|---|
-| Exact-input | `< 0` | Minimum output | Actual fb output |
-| Exact-output | `> 0` | Maximum input | Actual fb input |
-
-The hook checks the actual fb result, not an estimate. For exact-input, it reverts if `actualAmountOut < amountLimit`. For exact-output, it reverts if `actualAmountIn > amountLimit`.
+- **`sqrtPriceLimitX96`** — the caller-supplied limit is mapped into the fb pool's price space before the fb swap. When the fb pool's token order is inverted relative to cur (`few0 > few1`), the limit is inverted accordingly (`2^192 / limit`) and clamped to the valid sqrt-price range.
+- **Router safeguards** — the caller's router (e.g., a position manager or external router) enforces deadline, minimum output, and maximum input, exactly as it would for a direct v4 swap.
+- **Complete fill** — exact-input and exact-output fb swaps must fill completely; a partial fill reverts the whole transaction (`FbSwapPartialFill`).
 
 ### Failure Semantics
 
-An explicit fb request reverts if any of the following occurs:
+A swap reverts if any of the following occurs on the fb route:
 
-- `hookData` is not the exact `(uint256,uint256)` encoding;
-- the request has expired;
-- `amountLimit` is zero;
-- a wrapper or initialized, liquid fb pool is unavailable;
-- the fb swap cannot fill completely;
-- the actual output/input violates `amountLimit`;
+- either currency is native ETH (use WETH-wrapped tokens);
+- the cur pool has a dynamic fee;
+- a wrapper is missing, not a contract, does not map back to its origin token, or duplicates the other wrapper;
+- the fb pool has zero active liquidity;
 - PoolManager origin-token inventory is insufficient;
+- the fb swap cannot fill completely;
+- the fb swap returns a direction-inconsistent delta;
 - strict wrapping, unwrapping, balance, or settlement checks fail.
 
-There is no explicit "force fb" mode — the hook always picks the better pool by spot price. If fb is chosen but its liquidity is too shallow, the safety check (or caller's limit) reverts the transaction. The caller cannot override the routing decision via `hookData`; `hookData` only controls slippage protection strength when fb is chosen.
+There is no route override and no partial-fill fallback. If fb is unavailable or not deeper, the cur pool executes normally with the caller's original parameters (including `sqrtPriceLimitX96`).
 
 ## BeforeSwapDelta
 
-For an fb request, the hook uses `beforeSwapReturnDelta` to replace the cur pool swap:
+When fb is chosen, the hook uses `beforeSwapReturnDelta` to replace the cur pool swap:
 
 - `specifiedDelta = -amountSpecified` sets `amountToSwap = 0` in the cur pool.
 - `unspecifiedDelta` is based on the actual fb output for exact-input or actual fb input for exact-output.
 
-For empty `hookData` where fb is not better or unavailable, the hook returns a zero delta and the cur pool executes normally. When fb is chosen (empty or non-empty `hookData`), the hook returns a `BeforeSwapDelta` that replaces the cur swap.
+When fb is not chosen, the hook returns a zero delta and the cur pool executes normally.
 
-## Auto-Routing Safety Model
+## Depth-Routing Safety Model
 
-The hook always uses marginal `sqrtPriceX96` as the routing signal. This is the price for an infinitesimally small trade and does not account for trade size, liquidity depth, or tick crossings. To protect against shallow-pool traps, the hook performs a post-execution safety check when fb is chosen with empty `hookData`:
+Routing on active liquidity is simple and manipulation-resistant in the intended deployment:
 
-- For exact-input: fb's actual output must be >= cur's marginal output for the same input.
-- For exact-output: fb's actual input must be <= cur's marginal input for the same output.
-
-If the safety check fails, the transaction reverts. This means fb only executes when it is definitively better than cur's best-case scenario. The check is conservative — it may revert in cases where fb is still competitive but does not beat cur's marginal rate. In such cases, the user can retry with `hookData` containing a caller-supplied limit that accepts the actual fb result.
-
-## Optional Caller-Supplied Limits
-
-For stronger slippage protection, the caller can encode `(deadline, amountLimit)` in `hookData`. When fb is chosen and `hookData` is non-empty, the caller's limit is enforced instead of the cur-marginal safety check:
-
-1. derive a nonzero minimum output or maximum input from a complete off-chain fb quote;
-2. set a short deadline;
-3. encode those values in `hookData` and ensure the router forwards it unchanged.
-
-If fb is not better by spot price, `hookData` is ignored and cur executes normally. The caller's limit only applies when fb is actually chosen.
+- **Liquidity is the signal.** In-range liquidity is a scalar independent of token ordering and cannot be inflated without committing real capital to the pool.
+- **Arbitrage alignment.** Because wrapping is 1:1, any price gap between cur and fb is arbitraged back toward parity; the deeper pool is then the one that fills a given trade with less impact.
+- **No best-execution guarantee.** Depth routing does not compare realized prices. A trade can still be routed to fb when cur's marginal price is momentarily better. Callers who need execution guarantees should use `sqrtPriceLimitX96` and router-level deadline/min-out/max-in protections.
+- **Partial fills revert.** If fb's liquidity cannot absorb the full requested amount, the entire transaction reverts rather than filling partially.
 
 ## Hook Permissions
 
 ```
-beforeSwap: true            <- interpret the explicit route request
-beforeSwapReturnDelta: true <- replace the cur swap for an fb request
+beforeSwap: true            <- route between cur and fb pools
+beforeSwapReturnDelta: true <- replace the cur swap for an fb-routed swap
 all others: false
 ```
 
@@ -189,7 +162,7 @@ Anyone can add liquidity to the cur pool. The hook does not intercept liquidity 
 
 ### Step 5: Ensure the Fb Pool Exists
 
-The fb pool must be initialized separately (by anyone) with the same fee and tick spacing as the cur pool, using the FewToken-wrapped versions of the tokens. If it is unavailable, empty-data cur swaps still work, but explicit fb requests revert.
+The fb pool must be initialized separately (by anyone) with the same fee and tick spacing as the cur pool, using the FewToken-wrapped versions of the tokens. Until it exists and holds liquidity, all swaps execute on the cur pool. Note that the fb pool must be **strictly deeper** than cur for routing to switch; keep cur liquidity depth in mind when seeding the fb pool.
 
 ### Local Testing on Anvil
 
@@ -203,6 +176,12 @@ forge script script/DeployLocal.s.sol \
 ```
 
 This deploys everything from scratch (PoolManager, mock tokens, mock FewFactory, hook, cur pool, and fb pool with liquidity) and runs a test swap to verify fallback routing.
+
+Additional anvil-based test reports with worked examples (address-order inversion, exact-input and exact-output fills) are available in:
+
+- `docs/anvil-exact-in-test-report.md`
+- `docs/anvil-exact-out-test-report.md`
+- `docs/anvil-test-report-explained.md`
 
 ## Usage
 
@@ -218,18 +197,15 @@ PoolKey memory curKey = PoolKey({
 SwapParams memory params = SwapParams({
     zeroForOne: true,
     amountSpecified: -1e6,
-    sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+    sqrtPriceLimitX96: minPriceLimitX96 // caller's price limit; mapped into fb's space when fb is used
 });
 
-// Default: hook compares spot prices and picks the better pool.
-// If fb is chosen, cur's marginal estimate is used as the safety bound.
+// hookData is ignored. The hook routes to fb when it is strictly deeper
+// than cur; otherwise the cur pool executes normally.
 poolManager.swap(curKey, params, "");
-
-// Optional: stronger slippage protection when fb is chosen:
-poolManager.swap(curKey, params, abi.encode(block.timestamp + 5 minutes, minimumOutput));
 ```
 
-For an exact-output request, the second encoded value is `maximumInput`.
+Slippage protection comes from `sqrtPriceLimitX96` (honored on both routes, mapped into the fb pool's price space when inverted) plus whatever deadline / min-out / max-in checks the caller's router applies.
 
 ## Safety Model and Limitations
 
@@ -237,14 +213,13 @@ For an exact-output request, the second encoded value is `maximumInput`.
 - **No reentrancy:** `ReentrancyGuard` protects `beforeSwap`.
 - **Strict 1:1 wrap/unwrap:** return values and balance changes are verified.
 - **No residual balances:** the hook is designed to hold zero tokens after each successful fb swap.
-- **Validated hookData:** only empty data or the exact 64-byte fb request encoding is accepted.
-- **Actual-result limits:** fb minimum output or maximum input is checked after execution; any violation reverts the transaction atomically.
+- **hookData ignored:** no user-supplied route selection, addresses, or limits are accepted.
 - **Exact fill required:** exact-input and exact-output fb swaps must fill completely.
-- **External quoting required:** the hook provides no optimal-route guarantee; quote quality and route comparison are integration responsibilities.
-- **Cur-path safeguards are external:** the cur route relies on router/user protections because it has no encoded fb limit or deadline.
-- **Fallback routing requires ERC-20 currencies:** an empty-data cur route retains standard v4 native-currency behavior; use WETH when requesting fb.
-- **Fallback routing does not support dynamic fees:** an empty-data cur route retains the pool's standard dynamic-fee behavior.
-- **PoolManager inventory dependency:** insufficient physical origin input reverts an fb request.
+- **Depth-based routing, not best-price:** no on-chain quote comparison or best-execution guarantee; use price limits and router safeguards.
+- **Cur-path safeguards are external:** the cur route relies on router/user protections (`sqrtPriceLimitX96`, deadline, min-out/max-in).
+- **Fallback routing requires ERC-20 currencies:** native-ETH cur pools fall back to a normal cur swap.
+- **Fallback routing does not support dynamic fees:** dynamic-fee cur pools fall back to a normal cur swap.
+- **PoolManager inventory dependency:** insufficient physical origin input reverts an fb-routed swap.
 
 ## Contract Addresses (Ethereum Mainnet)
 

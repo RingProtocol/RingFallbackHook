@@ -22,6 +22,7 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import {DeltaResolver} from "v4-periphery/src/base/DeltaResolver.sol";
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
+import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 import {IFewFactory} from "./interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "./interfaces/external/IFewWrappedToken.sol";
@@ -62,7 +63,6 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     using StateLibrary for IPoolManager;
 
     error ZeroAddress();
-    error NativeCurrencyNotSupported();
     error DynamicFeeNotSupported();
     error WrapperUnderlyingMismatch(address wrapper, address expected, address actual);
     error FbSwapDirectionMismatch();
@@ -88,13 +88,18 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     );
 
     IFewFactory public immutable fewFactory;
+    IWETH9 public immutable weth;
 
-    constructor(IPoolManager _poolManager, IFewFactory _fewFactory) BaseHook(_poolManager) {
-        if (address(_poolManager) == address(0) || address(_fewFactory) == address(0)) {
+    constructor(IPoolManager _poolManager, IFewFactory _fewFactory, IWETH9 _weth) BaseHook(_poolManager) {
+        if (address(_poolManager) == address(0) || address(_fewFactory) == address(0) || address(_weth) == address(0)) {
             revert ZeroAddress();
         }
         fewFactory = _fewFactory;
+        weth = _weth;
     }
+
+    /// @dev Required to receive native ETH from PoolManager.take() and WETH9.withdraw().
+    receive() external payable {}
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -144,7 +149,7 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             _executeFbSwap(route, fbZeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
 
         address inputToken = params.zeroForOne ? route.token0 : route.token1;
-        uint256 availableInput = IERC20(inputToken).balanceOf(address(poolManager));
+        uint256 availableInput = Currency.wrap(inputToken).balanceOf(address(poolManager));
         if (availableInput < amountIn) {
             revert InsufficientSettlementInventory(inputToken, availableInput, amountIn);
         }
@@ -183,17 +188,22 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         address token0 = Currency.unwrap(key.currency0);
         address token1 = Currency.unwrap(key.currency1);
 
-        if (token0 == address(0) || token1 == address(0)) return _emptyRoute(token0, token1, key);
+        // Native ETH (address(0)) maps to WETH for wrapper lookup. The fb pool uses FewWETH
+        // (whose underlying is WETH), and the hook bridges ETH <-> WETH <-> FewWETH atomically.
+        address lookup0 = token0 == address(0) ? address(weth) : token0;
+        address lookup1 = token1 == address(0) ? address(weth) : token1;
+
         if (key.fee.isDynamicFee()) return _emptyRoute(token0, token1, key);
 
-        address few0 = fewFactory.getWrappedToken(token0);
-        address few1 = fewFactory.getWrappedToken(token1);
+        address few0 = fewFactory.getWrappedToken(lookup0);
+        address few1 = fewFactory.getWrappedToken(lookup1);
         if (few0 == address(0) || few1 == address(0) || few0 == few1) {
             return _emptyRoute(token0, token1, key);
         }
         if (few0.code.length == 0 || few1.code.length == 0) return _emptyRoute(token0, token1, key);
 
-        if (IFewWrappedToken(few0).token() != token0 || IFewWrappedToken(few1).token() != token1) {
+        // For native ETH, the wrapper's underlying is WETH (not address(0)).
+        if (IFewWrappedToken(few0).token() != lookup0 || IFewWrappedToken(few1).token() != lookup1) {
             return _emptyRoute(token0, token1, key);
         }
 
@@ -346,10 +356,20 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         uint256 inputBefore = input.balanceOfSelf();
         uint256 fewBefore = IERC20(fewToken).balanceOf(address(this));
 
-        IERC20(Currency.unwrap(input)).forceApprove(fewToken, amount);
-        uint256 returnedAmount = IFewWrappedToken(fewToken).wrap(amount);
-        IERC20(Currency.unwrap(input)).forceApprove(fewToken, 0);
-        if (returnedAmount != amount) revert WrapReturnMismatch(returnedAmount, amount);
+        if (input.isAddressZero()) {
+            uint256 wethBefore = IERC20(address(weth)).balanceOf(address(this));
+            weth.deposit{value: amount}();
+            IERC20(address(weth)).forceApprove(fewToken, amount);
+            uint256 returnedAmount = IFewWrappedToken(fewToken).wrap(amount);
+            IERC20(address(weth)).forceApprove(fewToken, 0);
+            if (returnedAmount != amount) revert WrapReturnMismatch(returnedAmount, amount);
+            _requireBalance(Currency.wrap(address(weth)), wethBefore);
+        } else {
+            IERC20(Currency.unwrap(input)).forceApprove(fewToken, amount);
+            uint256 returnedAmount = IFewWrappedToken(fewToken).wrap(amount);
+            IERC20(Currency.unwrap(input)).forceApprove(fewToken, 0);
+            if (returnedAmount != amount) revert WrapReturnMismatch(returnedAmount, amount);
+        }
 
         if (inputBefore < amount) {
             revert InsufficientConversionBalance(Currency.unwrap(input), inputBefore, amount);
@@ -361,8 +381,17 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     function _unwrapExact(address fewToken, Currency output, uint256 amount) internal {
         uint256 fewBefore = IERC20(fewToken).balanceOf(address(this));
         uint256 outputBefore = output.balanceOfSelf();
-        uint256 returnedAmount = IFewWrappedToken(fewToken).unwrap(amount);
-        if (returnedAmount != amount) revert UnwrapReturnMismatch(returnedAmount, amount);
+
+        if (output.isAddressZero()) {
+            uint256 wethBefore = IERC20(address(weth)).balanceOf(address(this));
+            uint256 returnedAmount = IFewWrappedToken(fewToken).unwrap(amount);
+            if (returnedAmount != amount) revert UnwrapReturnMismatch(returnedAmount, amount);
+            weth.withdraw(amount);
+            _requireBalance(Currency.wrap(address(weth)), wethBefore);
+        } else {
+            uint256 returnedAmount = IFewWrappedToken(fewToken).unwrap(amount);
+            if (returnedAmount != amount) revert UnwrapReturnMismatch(returnedAmount, amount);
+        }
 
         if (fewBefore < amount) revert InsufficientConversionBalance(fewToken, fewBefore, amount);
         _requireBalance(Currency.wrap(fewToken), fewBefore - amount);
@@ -371,8 +400,13 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
 
     function _settleExact(Currency currency, uint256 amount) internal {
         poolManager.sync(currency);
-        currency.transfer(address(poolManager), amount);
-        uint256 paid = poolManager.settle();
+        uint256 paid;
+        if (currency.isAddressZero()) {
+            paid = poolManager.settle{value: amount}();
+        } else {
+            currency.transfer(address(poolManager), amount);
+            paid = poolManager.settle();
+        }
         if (paid != amount) revert SettlementAmountMismatch(Currency.unwrap(currency), paid, amount);
     }
 
