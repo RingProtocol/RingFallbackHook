@@ -23,6 +23,8 @@ import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/Pool
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
 import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
+import {V4Quoter} from "v4-periphery/src/lens/V4Quoter.sol";
+import {IV4Quoter} from "v4-periphery/src/interfaces/IV4Quoter.sol";
 
 import {RingFallbackHook} from "../../src/RingFallbackHook.sol";
 import {IFewFactory} from "../../src/interfaces/external/IFewFactory.sol";
@@ -30,6 +32,7 @@ import {IFewWrappedToken} from "../../src/interfaces/external/IFewWrappedToken.s
 import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
 
 import {MockFewFactory} from "../mocks/MockFewFactory.sol";
+import {MockFewWrappedToken} from "../mocks/MockFewWrappedToken.sol";
 import {MockWETH9} from "../mocks/MockWETH9.sol";
 
 /// @notice Integration tests for RingFallbackHook using a fresh local PoolManager and mock FewFactory.
@@ -50,6 +53,7 @@ contract RingFallbackHookTest is Test {
     IPoolManager internal manager;
     PoolSwapTest internal swapRouter;
     PoolModifyLiquidityTest internal liquidityRouter;
+    V4Quoter internal v4Quoter;
 
     MockFewFactory internal factory;
     MockWETH9 internal weth;
@@ -77,6 +81,7 @@ contract RingFallbackHookTest is Test {
         manager = new PoolManager(address(this));
         swapRouter = new PoolSwapTest(manager);
         liquidityRouter = new PoolModifyLiquidityTest(manager);
+        v4Quoter = new V4Quoter(manager);
 
         // Deploy mock tokens.
         tokenA = new MockERC20("TokenA", "TA", 18);
@@ -700,7 +705,7 @@ contract RingFallbackHookTest is Test {
 
         vm.prank(newOwner);
         hook.setFbPool(curKey, fbKey);
-        (, bool isSet) = hook.fbPools(curKey.toId());
+        (,, bool isSet) = hook.fbPools(curKey.toId());
         assertTrue(isSet, "new owner registered");
     }
 
@@ -713,7 +718,7 @@ contract RingFallbackHookTest is Test {
         emit RingFallbackHook.FbPoolSet(curKey.toId(), fbKey);
         hook.setFbPool(curKey, fbKey);
 
-        (PoolKey memory rKey, bool rSet) = hook.fbPools(curKey.toId());
+        (PoolKey memory rKey,, bool rSet) = hook.fbPools(curKey.toId());
         assertTrue(rSet, "registered");
         assertEq(Currency.unwrap(rKey.currency0), Currency.unwrap(fbKey.currency0), "currency0");
         assertEq(Currency.unwrap(rKey.currency1), Currency.unwrap(fbKey.currency1), "currency1");
@@ -758,7 +763,7 @@ contract RingFallbackHookTest is Test {
     function test_setFbPool_emptyKeyRemovesRegistration() public {
         // Register first.
         hook.setFbPool(curKey, fbKey);
-        (, bool isSet) = hook.fbPools(curKey.toId());
+        (,, bool isSet) = hook.fbPools(curKey.toId());
         assertTrue(isSet, "registered");
 
         // Empty fbPoolKey (currency0 == address(0)) removes the registration.
@@ -774,7 +779,7 @@ contract RingFallbackHookTest is Test {
         emit RingFallbackHook.FbPoolRemoved(curKey.toId());
         hook.setFbPool(curKey, emptyKey);
 
-        (, bool rSet) = hook.fbPools(curKey.toId());
+        (,, bool rSet) = hook.fbPools(curKey.toId());
         assertFalse(rSet, "removed");
     }
 
@@ -864,9 +869,9 @@ contract RingFallbackHookTest is Test {
         assertTrue(fbPriceAfter != fbPriceBefore, "auto-inferred fb price moved");
     }
 
-    function test_registeredFbPoolWithInvalidWrapper_reverts() public {
-        // Register an fb pool with a bogus few0 address (no code / wrong underlying). The hook should
-        // validate wrappers at swap time and treat the route as unavailable, so the swap reverts.
+    function test_registeredFbPoolWithInvalidWrapper_revertsAtSetTime() public {
+        // Register an fb pool with a bogus few0 address (no code). setFbPool validates wrappers at
+        // registration time, so the bogus wrapper is rejected immediately.
         address bogusFew0 = makeAddr("bogusFew0");
 
         PoolKey memory bogusFbKey = PoolKey({
@@ -877,14 +882,70 @@ contract RingFallbackHookTest is Test {
             hooks: IHooks(address(0))
         });
 
+        vm.expectRevert(RingFallbackHook.ZeroAddress.selector);
         hook.setFbPool(curKey, bogusFbKey);
+    }
 
+    function test_registeredFbPoolWithWrongUnderlying_revertsAtSetTime() public {
+        // Register an fb pool where the wrappers don't correspond to the cur pool's tokens at all.
+        // setFbPool validates wrappers at registration time, so this is rejected immediately.
+        address fakeWrapper = address(new MockFewWrappedToken(makeAddr("wrongUnderlying")));
+
+        // Construct an fbPoolKey using the fake wrapper. Ensure v4 ordering.
+        address other = fewB;
+        address fbCur0 = fakeWrapper < other ? fakeWrapper : other;
+        address fbCur1 = fakeWrapper < other ? other : fakeWrapper;
+
+        PoolKey memory badFbKey = PoolKey({
+            currency0: Currency.wrap(fbCur0),
+            currency1: Currency.wrap(fbCur1),
+            fee: FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(0))
+        });
+
+        vm.expectRevert();
+        hook.setFbPool(curKey, badFbKey);
+    }
+
+    // ---------------------------------------------------------------------
+    // quote tests
+    // ---------------------------------------------------------------------
+
+    function test_quote_exactInput_returnsExpectedAmountOut() public {
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
         _addFbLiquidity(FB_LIQUIDITY);
 
-        _expectFbRevertOnSwap(true, -int256(SWAP_AMOUNT), RingFallbackHook.FbRouteUnavailable.selector);
+        // Quote exact-input: swap SWAP_AMOUNT/100 of token0 for token1.
+        (uint256 amountIn, uint256 amountOut) = hook.quote(curKey, true, -int256(SWAP_AMOUNT / 100), v4Quoter);
+
+        assertEq(amountIn, SWAP_AMOUNT / 100, "amountIn");
+        assertTrue(amountOut > 0, "amountOut > 0");
+    }
+
+    function test_quote_exactOutput_returnsExpectedAmountIn() public {
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
+        _addCurLiquidity(1e18);
+        _addFbLiquidity(FB_LIQUIDITY);
+
+        // Quote exact-output: want SWAP_AMOUNT/100 of token1.
+        uint256 exactOut = SWAP_AMOUNT / 100;
+        (uint256 amountIn, uint256 amountOut) = hook.quote(curKey, true, int256(exactOut), v4Quoter);
+
+        assertEq(amountOut, exactOut, "amountOut");
+        assertTrue(amountIn > 0, "amountIn > 0");
+    }
+
+    function test_quote_revertsWhenFbUnavailable() public {
+        // fb not initialized → quote reverts.
+        manager.initialize(curKey, SQRT_PRICE_1_1);
+        _addCurLiquidity(1e18);
+
+        vm.expectRevert(RingFallbackHook.FbRouteUnavailable.selector);
+        hook.quote(curKey, true, -int256(SWAP_AMOUNT), v4Quoter);
     }
 
     // ---------------------------------------------------------------------

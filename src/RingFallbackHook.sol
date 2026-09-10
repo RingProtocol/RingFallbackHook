@@ -23,6 +23,7 @@ import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {DeltaResolver} from "v4-periphery/src/base/DeltaResolver.sol";
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
 import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
+import {IV4Quoter} from "v4-periphery/src/interfaces/IV4Quoter.sol";
 
 import {IFewFactory} from "./interfaces/external/IFewFactory.sol";
 import {IFewWrappedToken} from "./interfaces/external/IFewWrappedToken.sol";
@@ -103,6 +104,7 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
 
     struct FbPool {
         PoolKey fbPoolKey;
+        bool orderAligned;
         bool set;
     }
 
@@ -133,9 +135,9 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     }
 
     /// @notice Registers an explicit fb pool for the given cur pool. The `fbPoolKey` must be hookless
-    ///         and its currencies must be FewToken wrappers for the cur pool's origin currencies.
-    ///         Passing an empty `fbPoolKey` (currency0 == address(0)) removes the registration,
-    ///         causing the hook to fall back to FewFactory auto-inference for that cur pool.
+    ///         and its currency0/currency1 must be FewToken wrappers for curPoolKey.currency0/currency1
+    ///         respectively (same ordering). Passing an empty `fbPoolKey` (currency0 == address(0))
+    ///         removes the registration, causing the hook to fall back to FewFactory auto-inference.
     function setFbPool(PoolKey calldata curPoolKey, PoolKey calldata fbPoolKey) external onlyOwner {
         PoolId curPoolId = curPoolKey.toId();
 
@@ -152,8 +154,80 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         if (Currency.unwrap(fbPoolKey.currency1) == address(0)) revert ZeroAddress();
         if (fbPoolKey.currency0 >= fbPoolKey.currency1) revert ZeroAddress();
 
-        fbPools[curPoolId] = FbPool({fbPoolKey: fbPoolKey, set: true});
+        // Validate: fbPoolKey.currency0/currency1 must be FewToken wrappers for curPoolKey's
+        // currencies (in either order). Native ETH (address(0)) maps to WETH for comparison.
+        address curLookup0 = Currency.unwrap(curPoolKey.currency0);
+        address curLookup1 = Currency.unwrap(curPoolKey.currency1);
+        curLookup0 = curLookup0 == address(0) ? address(weth) : curLookup0;
+        curLookup1 = curLookup1 == address(0) ? address(weth) : curLookup1;
+        address few0 = Currency.unwrap(fbPoolKey.currency0);
+        address few1 = Currency.unwrap(fbPoolKey.currency1);
+        if (few0.code.length == 0 || few1.code.length == 0) revert ZeroAddress();
+
+        address underlying0 = IFewWrappedToken(few0).token();
+        address underlying1 = IFewWrappedToken(few1).token();
+        bool orderAligned;
+        if (underlying0 == curLookup0 && underlying1 == curLookup1) {
+            orderAligned = true;
+        } else if (underlying0 == curLookup1 && underlying1 == curLookup0) {
+            orderAligned = false;
+        } else {
+            revert WrapperUnderlyingMismatch(few0, curLookup0, underlying0);
+        }
+
+        fbPools[curPoolId] = FbPool({fbPoolKey: fbPoolKey, orderAligned: orderAligned, set: true});
         emit FbPoolSet(curPoolId, fbPoolKey);
+    }
+
+    // ---------------------------------------------------------------------
+    // Quote
+    // ---------------------------------------------------------------------
+
+    /// @notice Quotes the expected amountIn/amountOut for a swap through the hook's fb route.
+    ///         Uses an external V4Quoter to simulate the fb pool swap. Since wrap/unwrap is 1:1,
+    ///         the fb pool quote equals the effective quote the user would receive.
+    /// @dev Not marked `view` because V4Quoter uses revert-based simulation. Does not modify state.
+    /// @param curPoolKey The cur pool key (same key the user would swap through).
+    /// @param zeroForOne The swap direction on the cur pool.
+    /// @param amountSpecified Negative for exact-input, positive for exact-output.
+    /// @param v4Quoter The V4Quoter contract address.
+    /// @return amountIn The estimated origin input.
+    /// @return amountOut The estimated origin output.
+    function quote(PoolKey calldata curPoolKey, bool zeroForOne, int256 amountSpecified, IV4Quoter v4Quoter)
+        external
+        returns (uint256 amountIn, uint256 amountOut)
+    {
+        FbRoute memory route = _deriveFbRoute(curPoolKey);
+        if (!route.available) revert FbRouteUnavailable();
+
+        bool fbZeroForOne = zeroForOne == route.orderAligned;
+        PoolKey memory fbKey = PoolKey({
+            currency0: Currency.wrap(route.orderAligned ? route.few0 : route.few1),
+            currency1: Currency.wrap(route.orderAligned ? route.few1 : route.few0),
+            fee: route.fee,
+            tickSpacing: route.tickSpacing,
+            hooks: IHooks(address(0))
+        });
+
+        if (amountSpecified < 0) {
+            // Exact-input: quote amountOut.
+            uint256 exactAmount = uint256(-amountSpecified);
+            (amountOut,) = v4Quoter.quoteExactInputSingle(
+                IV4Quoter.QuoteExactSingleParams({
+                    poolKey: fbKey, zeroForOne: fbZeroForOne, exactAmount: uint128(exactAmount), hookData: bytes("")
+                })
+            );
+            amountIn = exactAmount;
+        } else {
+            // Exact-output: quote amountIn.
+            uint256 exactAmount = uint256(amountSpecified);
+            (amountIn,) = v4Quoter.quoteExactOutputSingle(
+                IV4Quoter.QuoteExactSingleParams({
+                    poolKey: fbKey, zeroForOne: fbZeroForOne, exactAmount: uint128(exactAmount), hookData: bytes("")
+                })
+            );
+            amountOut = exactAmount;
+        }
     }
 
     /// @dev Required to receive native ETH from PoolManager.take() and WETH9.withdraw().
@@ -264,19 +338,15 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         FbPool memory registered = fbPools[curPoolId];
         if (registered.set) {
             PoolKey memory fbKey = registered.fbPoolKey;
-            address regFew0 = Currency.unwrap(fbKey.currency0);
-            address regFew1 = Currency.unwrap(fbKey.currency1);
-            // Validate hookless + wrappers at runtime (wrappers may have been compromised).
-            if (address(fbKey.hooks) != address(0)) {
+            bool orderAligned = registered.orderAligned;
+            // few0/few1 in the route always wrap cur token0/token1 respectively.
+            address few0 = Currency.unwrap(orderAligned ? fbKey.currency0 : fbKey.currency1);
+            address few1 = Currency.unwrap(orderAligned ? fbKey.currency1 : fbKey.currency0);
+            // Runtime validation: wrappers may have been compromised after registration.
+            if (address(fbKey.hooks) != address(0) || !_validateWrappers(few0, few1, lookup0, lookup1)) {
                 return _emptyRoute(token0, token1, key.fee, key.tickSpacing);
             }
-            // Determine which fb currency wraps which origin token, and validate wrappers.
-            (bool orderAligned, address regResolvedFew0, address regResolvedFew1) =
-                _resolveFbOrder(regFew0, regFew1, lookup0, lookup1);
-            if (regResolvedFew0 == address(0)) {
-                return _emptyRoute(token0, token1, key.fee, key.tickSpacing);
-            }
-            return _assembleRouteFromKey(token0, token1, regResolvedFew0, regResolvedFew1, fbKey, orderAligned);
+            return _assembleRouteFromKey(token0, token1, few0, few1, fbKey, orderAligned);
         }
 
         // 2. Fall back to FewFactory auto-inference, reusing the cur pool's fee and tick spacing.
@@ -286,33 +356,6 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             return _emptyRoute(token0, token1, key.fee, key.tickSpacing);
         }
         return _assembleRoute(token0, token1, few0, few1, key.fee, key.tickSpacing);
-    }
-
-    /// @dev Given two fb pool currencies (fewTokens), determines which wraps `lookup0` and which wraps
-    ///      `lookup1`. Returns `(orderAligned, few0, few1)` where `few0` wraps `lookup0` (cur token0)
-    ///      and `few1` wraps `lookup1` (cur token1). `orderAligned` is true when the fb pool's
-    ///      currency0 wraps cur token0 (same ordering as cur). Returns `(false, address(0), address(0))`
-    ///      if validation fails.
-    function _resolveFbOrder(address regFew0, address regFew1, address lookup0, address lookup1)
-        internal
-        view
-        returns (bool orderAligned, address few0, address few1)
-    {
-        if (regFew0 == address(0) || regFew1 == address(0) || regFew0 == regFew1) {
-            return (false, address(0), address(0));
-        }
-        if (regFew0.code.length == 0 || regFew1.code.length == 0) return (false, address(0), address(0));
-
-        address underlying0 = IFewWrappedToken(regFew0).token();
-        address underlying1 = IFewWrappedToken(regFew1).token();
-
-        if (underlying0 == lookup0 && underlying1 == lookup1) {
-            return (true, regFew0, regFew1);
-        } else if (underlying0 == lookup1 && underlying1 == lookup0) {
-            return (false, regFew1, regFew0);
-        } else {
-            return (false, address(0), address(0));
-        }
     }
 
     /// @dev Validates that two FewToken wrappers are distinct, deployed, and wrap the expected underlying
@@ -353,9 +396,9 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         return _buildRoute(token0, token1, few0, few1, fee, tickSpacing, orderAligned, fbPoolId, true);
     }
 
-    /// @dev Builds a route from a registered fbPoolKey. `few0` wraps cur token0, `few1` wraps cur token1
-    ///      (already resolved by `_resolveFbOrder`). `orderAligned` indicates whether the fb pool's
-    ///      currency0 corresponds to cur token0. Reads fb active liquidity.
+    /// @dev Builds a route from a registered fbPoolKey. `few0`/`few1` are the fb pool's currency0/currency1
+    ///      addresses. `orderAligned` was determined at `setFbPool` time and stored in the FbPool struct.
+    ///      Reads fb active liquidity.
     function _assembleRouteFromKey(
         address token0,
         address token1,
