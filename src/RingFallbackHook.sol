@@ -45,10 +45,12 @@ import {IFewWrappedToken} from "./interfaces/external/IFewWrappedToken.sol";
 ///      hookData is ignored.
 ///
 ///      Safety model:
-///      - no owner, upgrade, pause, fee, sweep, or route setter;
+///      - a single transferable `owner` (set to the deployer at construction) can register explicit
+///        fb pool mappings; there is no upgrade, fee, pause, or sweep capability;
 ///      - anyone may add liquidity to the cur pool;
-///      - routing is always depth-based;
-///      - the fb pool key is derived purely from the cur pool key and FewFactory state;
+///      - routing is always depth-based; the cur pool is never used as a fallback venue;
+///      - the fb pool key is taken from the owner-registered `fbPools` mapping when present, otherwise
+///        derived purely from the cur pool key and FewFactory state;
 ///      - wrap/unwrap are strict 1:1 with return-value and balance checks;
 ///      - exact-input and exact-output requests must fill completely or the whole transaction reverts;
 ///      - the PoolManager must already hold enough physical origin input for the atomic flash conversion
@@ -75,6 +77,11 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
     error SettlementAmountMismatch(address token, uint256 paid, uint256 expected);
     error AmountOutOfRange(int256 amountSpecified);
     error FallbackRouteUnavailable();
+    error NotOwner(address caller, address owner);
+    error InvalidOriginOrder(address origin0, address origin1);
+    error FbRouteUnavailable();
+    error FbShallowerThanCur(uint128 curLiquidity, uint128 fbLiquidity);
+    error FbInsufficientInventory(address token, uint256 available, uint256 required);
 
     event FallbackSwap(
         PoolId indexed curPoolId,
@@ -86,9 +93,33 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         uint256 amountIn,
         uint256 amountOut
     );
+    event OwnerChanged(address indexed previousOwner, address indexed newOwner);
+    event FbPoolSet(
+        address indexed origin0, address indexed origin1, address few0, address few1, uint24 fee, int24 tickSpacing
+    );
+    event FbPoolRemoved(address indexed origin0, address indexed origin1);
 
     IFewFactory public immutable fewFactory;
     IWETH9 public immutable weth;
+
+    /// @notice Current owner. Set to the deployer at construction and transferable via `transferOwner`.
+    address public owner;
+
+    /// @notice Owner-registered explicit fb pool definitions, keyed by the origin currency pair.
+    mapping(bytes32 => FbPool) public fbPools;
+
+    struct FbPool {
+        address few0;
+        address few1;
+        uint24 fee;
+        int24 tickSpacing;
+        bool set;
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner(msg.sender, owner);
+        _;
+    }
 
     constructor(IPoolManager _poolManager, IFewFactory _fewFactory, IWETH9 _weth) BaseHook(_poolManager) {
         if (address(_poolManager) == address(0) || address(_fewFactory) == address(0) || address(_weth) == address(0)) {
@@ -96,6 +127,47 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         }
         fewFactory = _fewFactory;
         weth = _weth;
+        owner = msg.sender;
+        emit OwnerChanged(address(0), msg.sender);
+    }
+
+    // ---------------------------------------------------------------------
+    // Owner controls
+    // ---------------------------------------------------------------------
+
+    /// @notice Transfers ownership to `newOwner`. The new owner must not be the zero address.
+    function transferOwner(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        emit OwnerChanged(owner, newOwner);
+        owner = newOwner;
+    }
+
+    /// @notice Registers an explicit fb pool for the origin currency pair `(origin0, origin1)`.
+    ///         `origin0` must be strictly less than `origin1` (v4 currency ordering). The registration
+    ///         takes precedence over FewFactory auto-inference for this pair.
+    function setFbPool(address origin0, address origin1, address few0, address few1, uint24 fee, int24 tickSpacing)
+        external
+        onlyOwner
+    {
+        if (origin0 == address(0) && origin1 == address(0)) revert ZeroAddress();
+        if (origin0 >= origin1) revert InvalidOriginOrder(origin0, origin1);
+        if (few0 == address(0) || few1 == address(0) || few0 == few1) revert ZeroAddress();
+        fbPools[_fbPoolMapKey(origin0, origin1)] =
+            FbPool({few0: few0, few1: few1, fee: fee, tickSpacing: tickSpacing, set: true});
+        emit FbPoolSet(origin0, origin1, few0, few1, fee, tickSpacing);
+    }
+
+    /// @notice Removes an owner-registered fb pool so the pair falls back to FewFactory auto-inference.
+    function removeFbPool(address origin0, address origin1) external onlyOwner {
+        if (origin0 >= origin1) revert InvalidOriginOrder(origin0, origin1);
+        delete fbPools[_fbPoolMapKey(origin0, origin1)];
+        emit FbPoolRemoved(origin0, origin1);
+    }
+
+    /// @dev Map key for `fbPools`. Origin currencies are v4-sorted (origin0 < origin1), so the packed
+    ///      encoding is deterministic. Native ETH (address(0)) is encoded as-is.
+    function _fbPoolMapKey(address origin0, address origin1) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(origin0, origin1));
     }
 
     /// @dev Required to receive native ETH from PoolManager.take() and WETH9.withdraw().
@@ -135,21 +207,32 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
 
         PoolId curPoolId = key.toId();
 
-        // Route to whichever pool has more active liquidity.
+        // fb is the only execution venue. If no route is available, revert.
         FbRoute memory route = _deriveFbRoute(key);
-        if (!route.available || !_isFbDeeper(route)) {
-            emit FallbackSwap(curPoolId, PoolId.wrap(0), sender, params.zeroForOne, false, params.amountSpecified, 0, 0);
-            return (IHooks.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
-        }
+        if (!route.available) revert FbRouteUnavailable();
 
-        // fb is deeper — execute fb. Slippage protection is provided by sqrtPriceLimitX96 (mapped to
+        // fb must be strictly deeper than cur to service the swap; otherwise revert.
+        if (!_isFbDeeper(route)) revert FbShallowerThanCur(route.curLiquidity, route.fbLiquidity);
+
+        // Pre-check PoolManager physical inventory before committing to the fb swap. If insufficient,
+        // revert early to save gas. Slippage protection is provided by sqrtPriceLimitX96 (mapped to
         // fb's price space) and the caller's router deadline/amount limits. hookData is ignored.
         bool fbZeroForOne = params.zeroForOne == route.orderAligned;
+        address inputToken = params.zeroForOne ? route.token0 : route.token1;
+        uint256 availableInput = Currency.wrap(inputToken).balanceOf(address(poolManager));
+        if (!_hasFbInventory(route, params.zeroForOne, fbZeroForOne, params.amountSpecified)) {
+            uint256 required = params.amountSpecified < 0
+                ? uint256(-params.amountSpecified)
+                : _estimateFbAmountIn(route, fbZeroForOne, uint256(params.amountSpecified));
+            revert FbInsufficientInventory(inputToken, availableInput, required);
+        }
+
         (uint256 amountIn, uint256 amountOut) =
             _executeFbSwap(route, fbZeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
 
-        address inputToken = params.zeroForOne ? route.token0 : route.token1;
-        uint256 availableInput = Currency.wrap(inputToken).balanceOf(address(poolManager));
+        // Safety net: for exact-output, the pre-check uses a marginal (lower-bound) estimate of
+        // amountIn. If actual amountIn exceeds the estimate and PoolManager lacks sufficient origin
+        // input, revert. This is a rare edge case — the pre-check catches the common insufficiency.
         if (availableInput < amountIn) {
             revert InsufficientSettlementInventory(inputToken, availableInput, amountIn);
         }
@@ -193,40 +276,74 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         address lookup0 = token0 == address(0) ? address(weth) : token0;
         address lookup1 = token1 == address(0) ? address(weth) : token1;
 
-        if (key.fee.isDynamicFee()) return _emptyRoute(token0, token1, key);
+        if (key.fee.isDynamicFee()) return _emptyRoute(token0, token1, key.fee, key.tickSpacing);
 
+        // 1. Owner-registered fb pool takes precedence over FewFactory auto-inference.
+        FbPool memory registered = fbPools[_fbPoolMapKey(token0, token1)];
+        if (registered.set) {
+            if (!_validateWrappers(registered.few0, registered.few1, lookup0, lookup1)) {
+                return _emptyRoute(token0, token1, key.fee, key.tickSpacing);
+            }
+            return _assembleRoute(
+                token0, token1, registered.few0, registered.few1, registered.fee, registered.tickSpacing, key
+            );
+        }
+
+        // 2. Fall back to FewFactory auto-inference, reusing the cur pool's fee and tick spacing.
         address few0 = fewFactory.getWrappedToken(lookup0);
         address few1 = fewFactory.getWrappedToken(lookup1);
-        if (few0 == address(0) || few1 == address(0) || few0 == few1) {
-            return _emptyRoute(token0, token1, key);
+        if (!_validateWrappers(few0, few1, lookup0, lookup1)) {
+            return _emptyRoute(token0, token1, key.fee, key.tickSpacing);
         }
-        if (few0.code.length == 0 || few1.code.length == 0) return _emptyRoute(token0, token1, key);
+        return _assembleRoute(token0, token1, few0, few1, key.fee, key.tickSpacing, key);
+    }
 
-        // For native ETH, the wrapper's underlying is WETH (not address(0)).
-        if (IFewWrappedToken(few0).token() != lookup0 || IFewWrappedToken(few1).token() != lookup1) {
-            return _emptyRoute(token0, token1, key);
-        }
+    /// @dev Validates that two FewToken wrappers are distinct, deployed, and wrap the expected underlying
+    ///      tokens. For native ETH the expected underlying is WETH (not address(0)).
+    function _validateWrappers(address few0, address few1, address lookup0, address lookup1)
+        internal
+        view
+        returns (bool)
+    {
+        if (few0 == address(0) || few1 == address(0) || few0 == few1) return false;
+        if (few0.code.length == 0 || few1.code.length == 0) return false;
+        if (IFewWrappedToken(few0).token() != lookup0 || IFewWrappedToken(few1).token() != lookup1) return false;
+        return true;
+    }
 
+    /// @dev Builds a route from validated wrappers and an explicit fee/tickSpacing (which may differ from
+    ///      the cur pool when an owner-registered fb pool is used). Reads fb and cur active liquidity.
+    function _assembleRoute(
+        address token0,
+        address token1,
+        address few0,
+        address few1,
+        uint24 fee,
+        int24 tickSpacing,
+        PoolKey calldata curKey
+    ) internal view returns (FbRoute memory) {
         bool orderAligned = few0 < few1;
         PoolKey memory fbKey = PoolKey({
             currency0: Currency.wrap(orderAligned ? few0 : few1),
             currency1: Currency.wrap(orderAligned ? few1 : few0),
-            fee: key.fee,
-            tickSpacing: key.tickSpacing,
+            fee: fee,
+            tickSpacing: tickSpacing,
             hooks: IHooks(address(0))
         });
         PoolId fbPoolId = fbKey.toId();
 
         uint128 fbLiquidity = poolManager.getLiquidity(fbPoolId);
         if (fbLiquidity == 0) {
-            return _buildRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId, 0, 0, false);
+            return _buildRoute(token0, token1, few0, few1, fee, tickSpacing, orderAligned, fbPoolId, 0, 0, false);
         }
 
         // The cur pool is guaranteed initialized: the hook is attached to it via PoolKey.hooks, and v4
         // only routes swaps through initialized pools. No slot0 price check is needed.
-        uint128 curLiquidity = poolManager.getLiquidity(key.toId());
+        uint128 curLiquidity = poolManager.getLiquidity(curKey.toId());
 
-        route = _buildRoute(token0, token1, few0, few1, key, orderAligned, fbPoolId, curLiquidity, fbLiquidity, true);
+        return _buildRoute(
+            token0, token1, few0, few1, fee, tickSpacing, orderAligned, fbPoolId, curLiquidity, fbLiquidity, true
+        );
     }
 
     function _buildRoute(
@@ -234,7 +351,8 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         address token1,
         address few0,
         address few1,
-        PoolKey calldata key,
+        uint24 fee,
+        int24 tickSpacing,
         bool orderAligned,
         PoolId fbPoolId,
         uint128 curLiquidity,
@@ -246,8 +364,8 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
             token1: token1,
             few0: few0,
             few1: few1,
-            fee: key.fee,
-            tickSpacing: key.tickSpacing,
+            fee: fee,
+            tickSpacing: tickSpacing,
             fbPoolId: fbPoolId,
             orderAligned: orderAligned,
             available: available,
@@ -256,8 +374,79 @@ contract RingFallbackHook is BaseHook, DeltaResolver, ReentrancyGuard {
         });
     }
 
-    function _emptyRoute(address token0, address token1, PoolKey calldata key) internal pure returns (FbRoute memory) {
-        return _buildRoute(token0, token1, address(0), address(0), key, false, PoolId.wrap(0), 0, 0, false);
+    function _emptyRoute(address token0, address token1, uint24 fee, int24 tickSpacing)
+        internal
+        pure
+        returns (FbRoute memory)
+    {
+        return _buildRoute(token0, token1, address(0), address(0), fee, tickSpacing, false, PoolId.wrap(0), 0, 0, false);
+    }
+
+    // ---------------------------------------------------------------------
+    // inventory pre-check
+    // ---------------------------------------------------------------------
+
+    /// @dev Pre-checks PoolManager physical inventory before committing to the fb swap. If any leg
+    ///      would fail at settlement, returns false so the caller gracefully falls back to cur.
+    ///
+    ///      For the known leg (exact-input: amountIn, exact-output: amountOut), checks exactly.
+    ///      For the unknown leg, uses the fb pool's marginal spot price as a conservative estimate:
+    ///      - exact-output: marginal amountIn is a lower bound; if available < lower bound, definitely
+    ///        insufficient → fall back. If available >= lower bound, proceed (post-swap check catches
+    ///        the rare case where actual amountIn exceeds the estimate).
+    ///      - exact-input: the fewOut side is not pre-checked (marginal amountOut is an upper bound,
+    ///        so checking against it could cause false cur-fallbacks). The fb pool's LPs deposited
+    ///        fewTokens into PoolManager, so fewOut is normally available; if not, the take reverts.
+    function _hasFbInventory(FbRoute memory route, bool curZeroForOne, bool fbZeroForOne, int256 amountSpecified)
+        internal
+        view
+        returns (bool)
+    {
+        address inputToken = curZeroForOne ? route.token0 : route.token1;
+        address fewOut = curZeroForOne ? route.few1 : route.few0;
+
+        uint256 availableInput = Currency.wrap(inputToken).balanceOf(address(poolManager));
+        uint256 availableFewOut = IERC20(fewOut).balanceOf(address(poolManager));
+
+        if (amountSpecified < 0) {
+            // Exact-input: amountIn is known.
+            uint256 amountIn = uint256(-amountSpecified);
+            if (availableInput < amountIn) return false;
+            // fewOut side not pre-checked (see NatSpec above).
+            return true;
+        } else {
+            // Exact-output: amountOut is known.
+            uint256 amountOut = uint256(amountSpecified);
+            if (availableFewOut < amountOut) return false;
+            // Estimate marginal amountIn (lower bound) from fb spot price.
+            uint256 estimatedAmountIn = _estimateFbAmountIn(route, fbZeroForOne, amountOut);
+            if (estimatedAmountIn == type(uint256).max) return false; // fb pool not initialized
+            if (availableInput < estimatedAmountIn) return false;
+            return true;
+        }
+    }
+
+    /// @dev Returns the marginal (minimum) amountIn needed for an exact-output swap of `amountOut`
+    ///      on the fb pool, using its current sqrtPriceX96. This is a lower bound — the actual
+    ///      amountIn is >= this due to price impact. Uses two-step FullMath to avoid overflow.
+    function _estimateFbAmountIn(FbRoute memory route, bool fbZeroForOne, uint256 amountOut)
+        internal
+        view
+        returns (uint256)
+    {
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(route.fbPoolId);
+        if (sqrtPriceX96 == 0) return type(uint256).max;
+
+        // sqrtPriceX96 = sqrt(price) * 2^96, where price = fbCurrency1 / fbCurrency0.
+        // fbZeroForOne (selling fbCurrency0, buying fbCurrency1):
+        //   amountIn = amountOut / price = amountOut * 2^192 / sqrtPriceX96^2
+        // !fbZeroForOne (selling fbCurrency1, buying fbCurrency0):
+        //   amountIn = amountOut * price = amountOut * sqrtPriceX96^2 / 2^192
+        if (fbZeroForOne) {
+            return FullMath.mulDiv(FullMath.mulDiv(amountOut, 1 << 96, sqrtPriceX96), 1 << 96, sqrtPriceX96);
+        } else {
+            return FullMath.mulDiv(FullMath.mulDiv(amountOut, sqrtPriceX96, 1 << 96), sqrtPriceX96, 1 << 96);
+        }
     }
 
     // ---------------------------------------------------------------------

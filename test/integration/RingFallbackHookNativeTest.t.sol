@@ -22,6 +22,7 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
 import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 import {IWETH9} from "v4-periphery/src/interfaces/external/IWETH9.sol";
+import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 
 import {RingFallbackHook} from "../../src/RingFallbackHook.sol";
 import {IFewFactory} from "../../src/interfaces/external/IFewFactory.sol";
@@ -162,14 +163,11 @@ contract RingFallbackHookNativeTest is Test {
     // Fallback to cur pool tests
     // ---------------------------------------------------------------------
 
-    function test_emptyHookDataUsesCurWhenFbNotInitialized() public {
+    function test_fbNotInitialized_reverts() public {
         manager.initialize(curKey, SQRT_PRICE_1_1);
         _addCurLiquidity(1e18);
 
-        _swapAsUser(true, -int256(SWAP_AMOUNT));
-
-        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
-        assertTrue(curPriceAfter != SQRT_PRICE_1_1, "cur price moved");
+        _expectFbRevertOnSwap(true, -int256(SWAP_AMOUNT), RingFallbackHook.FbRouteUnavailable.selector);
     }
 
     // ---------------------------------------------------------------------
@@ -293,6 +291,40 @@ contract RingFallbackHookNativeTest is Test {
     // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
+
+    /// @dev Returns `data` without its leading 4-byte selector.
+    function _stripSelector(bytes memory data) internal pure returns (bytes memory) {
+        bytes memory out = new bytes(data.length - 4);
+        for (uint256 i = 0; i < out.length; ++i) {
+            out[i] = data[i + 4];
+        }
+        return out;
+    }
+
+    /// @dev Asserts that a swap on curKey reverts with the given inner error selector, unwrapping
+    ///      the v4-core ERC-7751 WrappedError envelope.
+    function _expectFbRevertOnSwap(bool zeroForOne, int256 amountSpecified, bytes4 innerSelector) internal {
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        try swapRouter.swap(
+            curKey,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: amountSpecified,
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            settings,
+            bytes("")
+        ) {
+            assertTrue(false, "expected revert");
+        } catch (bytes memory reason) {
+            assertEq(bytes4(reason), CustomRevert.WrappedError.selector, "ERC-7751 wrapper");
+            (, bytes4 fnSelector, bytes memory inner,) =
+                abi.decode(_stripSelector(reason), (address, bytes4, bytes, bytes));
+            assertEq(fnSelector, IHooks.beforeSwap.selector, "wrapper selector");
+            assertEq(bytes4(inner), innerSelector, "inner selector");
+        }
+    }
 
     function _addCurLiquidity(uint256 liquidityAmount) internal {
         ModifyLiquidityParams memory params = ModifyLiquidityParams({
