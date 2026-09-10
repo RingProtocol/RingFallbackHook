@@ -242,14 +242,22 @@ contract RingFallbackHookTest is Test {
         _expectFbRevertOnSwap(true, -int256(SWAP_AMOUNT), RingFallbackHook.FbRouteUnavailable.selector);
     }
 
-    function test_fbLiquidityEqual_reverts() public {
-        // Both pools at the same price with equal liquidity. fb is not strictly deeper → revert.
+    function test_fbLiquidityEqual_stillRoutesToFb() public {
+        // Both pools at the same price with equal liquidity. fb is always used regardless of depth.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, SQRT_PRICE_1_1);
         _addCurLiquidity(1e18);
         _addFbLiquidity(1e18);
 
-        _expectFbRevertOnSwap(true, -int256(SWAP_AMOUNT), RingFallbackHook.FbShallowerThanCur.selector);
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
+        _swapAsUser(true, -int256(SWAP_AMOUNT / 1000));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
     // ---------------------------------------------------------------------
@@ -279,20 +287,28 @@ contract RingFallbackHookTest is Test {
         assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
     }
 
-    function test_fbShallower_reverts() public {
-        // fb price is better for zeroForOne, but fb liquidity is shallower than cur.
-        // fb is not strictly deeper → revert (no cur fallback).
+    function test_fbShallower_stillRoutesToFb() public {
+        // fb price is better for zeroForOne, and fb liquidity is shallower than cur.
+        // fb is always used regardless of depth comparison.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
         _addCurLiquidity(1e18);
         _addFbLiquidity(0.5e18);
 
-        _expectFbRevertOnSwap(true, -int256(SWAP_AMOUNT / 1000), RingFallbackHook.FbShallowerThanCur.selector);
+        (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceBefore,,,) = manager.getSlot0(fbKey.toId());
+
+        _swapAsUser(true, -int256(SWAP_AMOUNT / 1000));
+
+        (uint160 curPriceAfter,,,) = manager.getSlot0(curKey.toId());
+        (uint160 fbPriceAfter,,,) = manager.getSlot0(fbKey.toId());
+        assertEq(curPriceAfter, curPriceBefore, "cur price unchanged");
+        assertTrue(fbPriceAfter != fbPriceBefore, "fb price moved");
     }
 
-    function test_routesToFbWhenDeeperEvenIfPriceWorse() public {
-        // Depth-based routing: fb price is worse for zeroForOne, but fb is strictly deeper ->
-        // fb is still used. The fb price sits near the edge of the fb liquidity range in the swap's
+    function test_routesToFbEvenIfPriceWorse() public {
+        // fb price is worse for zeroForOne, but fb is always used regardless of depth or price.
+        // The fb price sits near the edge of the fb liquidity range in the swap's
         // direction, so use a small amount that still fills completely.
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterOneForZero());
@@ -682,11 +698,9 @@ contract RingFallbackHookTest is Test {
         address newOwner = makeAddr("newOwner");
         hook.transferOwner(newOwner);
 
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
         vm.prank(newOwner);
-        hook.setFbPool(origin0, origin1, fewA, fewB, FEE, TICK_SPACING);
-        (,,,, bool isSet) = hook.fbPools(keccak256(abi.encodePacked(origin0, origin1)));
+        hook.setFbPool(curKey, fbKey);
+        (, bool isSet) = hook.fbPools(curKey.toId());
         assertTrue(isSet, "new owner registered");
     }
 
@@ -695,68 +709,91 @@ contract RingFallbackHookTest is Test {
     // ---------------------------------------------------------------------
 
     function test_setFbPool_emitsAndRegisters() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
+        vm.expectEmit(true, false, false, true);
+        emit RingFallbackHook.FbPoolSet(curKey.toId(), fbKey);
+        hook.setFbPool(curKey, fbKey);
 
-        vm.expectEmit(true, true, false, true);
-        emit RingFallbackHook.FbPoolSet(origin0, origin1, fewA, fewB, FEE, TICK_SPACING);
-        hook.setFbPool(origin0, origin1, fewA, fewB, FEE, TICK_SPACING);
-
-        (address rFew0, address rFew1, uint24 rFee, int24 rTickSpacing, bool rSet) =
-            hook.fbPools(keccak256(abi.encodePacked(origin0, origin1)));
+        (PoolKey memory rKey, bool rSet) = hook.fbPools(curKey.toId());
         assertTrue(rSet, "registered");
-        assertEq(rFew0, fewA, "few0");
-        assertEq(rFew1, fewB, "few1");
-        assertEq(rFee, FEE, "fee");
-        assertEq(rTickSpacing, TICK_SPACING, "tickSpacing");
+        assertEq(Currency.unwrap(rKey.currency0), Currency.unwrap(fbKey.currency0), "currency0");
+        assertEq(Currency.unwrap(rKey.currency1), Currency.unwrap(fbKey.currency1), "currency1");
+        assertEq(rKey.fee, fbKey.fee, "fee");
+        assertEq(rKey.tickSpacing, fbKey.tickSpacing, "tickSpacing");
     }
 
     function test_setFbPool_revertsForNonOwner() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
         address attacker = makeAddr("attacker");
 
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(RingFallbackHook.NotOwner.selector, attacker, address(this)));
-        hook.setFbPool(origin0, origin1, fewA, fewB, FEE, TICK_SPACING);
+        hook.setFbPool(curKey, fbKey);
     }
 
-    function test_setFbPool_revertsOnReversedOrder() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
-        // Pass the higher address first to trigger InvalidOriginOrder.
-        vm.expectRevert(abi.encodeWithSelector(RingFallbackHook.InvalidOriginOrder.selector, origin1, origin0));
-        hook.setFbPool(origin1, origin0, fewA, fewB, FEE, TICK_SPACING);
+    function test_setFbPool_revertsOnNonHookless() public {
+        // fbPoolKey with a non-zero hooks address should revert.
+        PoolKey memory hookedFbKey = PoolKey({
+            currency0: fbKey.currency0,
+            currency1: fbKey.currency1,
+            fee: FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(0x1234))
+        });
+        vm.expectRevert(abi.encodeWithSelector(RingFallbackHook.FbPoolNotHookless.selector, address(0x1234)));
+        hook.setFbPool(curKey, hookedFbKey);
     }
 
-    function test_setFbPool_revertsOnZeroFew() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
+    function test_setFbPool_revertsOnZeroCurrency1() public {
+        // fbPoolKey with currency1 == address(0) should revert (not a valid removal).
+        PoolKey memory badKey = PoolKey({
+            currency0: fbKey.currency0,
+            currency1: Currency.wrap(address(0)),
+            fee: FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(0))
+        });
         vm.expectRevert(RingFallbackHook.ZeroAddress.selector);
-        hook.setFbPool(origin0, origin1, address(0), fewB, FEE, TICK_SPACING);
+        hook.setFbPool(curKey, badKey);
     }
 
-    function test_removeFbPool_emitsAndClears() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
-        hook.setFbPool(origin0, origin1, fewA, fewB, FEE, TICK_SPACING);
+    function test_setFbPool_emptyKeyRemovesRegistration() public {
+        // Register first.
+        hook.setFbPool(curKey, fbKey);
+        (, bool isSet) = hook.fbPools(curKey.toId());
+        assertTrue(isSet, "registered");
 
-        vm.expectEmit(true, true, false, false);
-        emit RingFallbackHook.FbPoolRemoved(origin0, origin1);
-        hook.removeFbPool(origin0, origin1);
+        // Empty fbPoolKey (currency0 == address(0)) removes the registration.
+        PoolKey memory emptyKey = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(0)),
+            fee: 0,
+            tickSpacing: 0,
+            hooks: IHooks(address(0))
+        });
 
-        (,,,, bool rSet) = hook.fbPools(keccak256(abi.encodePacked(origin0, origin1)));
+        vm.expectEmit(true, false, false, false);
+        emit RingFallbackHook.FbPoolRemoved(curKey.toId());
+        hook.setFbPool(curKey, emptyKey);
+
+        (, bool rSet) = hook.fbPools(curKey.toId());
         assertFalse(rSet, "removed");
     }
 
-    function test_removeFbPool_revertsForNonOwner() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
-        address attacker = makeAddr("attacker");
+    function test_setFbPool_emptyKeyRemoval_revertsForNonOwner() public {
+        // Register first.
+        hook.setFbPool(curKey, fbKey);
 
+        PoolKey memory emptyKey = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(0)),
+            fee: 0,
+            tickSpacing: 0,
+            hooks: IHooks(address(0))
+        });
+
+        address attacker = makeAddr("attacker");
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(RingFallbackHook.NotOwner.selector, attacker, address(this)));
-        hook.removeFbPool(origin0, origin1);
+        hook.setFbPool(curKey, emptyKey);
     }
 
     function test_registeredFbPoolTakesPrecedenceOverAutoInference() public {
@@ -764,8 +801,6 @@ contract RingFallbackHookTest is Test {
         // the cur fee, so if the fb swap executes against the registered fee, registration won.
         uint24 registeredFee = 3000;
         int24 registeredTickSpacing = 60;
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
 
         // Build the registered fb key (different fee/tickSpacing than curKey).
         bool fbOrderAligned = fewA < fewB;
@@ -786,7 +821,7 @@ contract RingFallbackHookTest is Test {
         // would be unavailable without registration.
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
 
-        hook.setFbPool(origin0, origin1, fewA, fewB, registeredFee, registeredTickSpacing);
+        hook.setFbPool(curKey, registeredFbKey);
 
         (uint160 curPriceBefore,,,) = manager.getSlot0(curKey.toId());
         (uint160 registeredFbPriceBefore,,,) = manager.getSlot0(registeredFbKey.toId());
@@ -799,13 +834,18 @@ contract RingFallbackHookTest is Test {
         assertTrue(registeredFbPriceAfter != registeredFbPriceBefore, "registered fb price moved");
     }
 
-    function test_removeFbPoolFallsBackToAutoInference() public {
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
+    function test_emptyKeyRemovalFallsBackToAutoInference() public {
+        // Register then remove via empty key.
+        hook.setFbPool(curKey, fbKey);
 
-        // Register then remove.
-        hook.setFbPool(origin0, origin1, fewA, fewB, FEE, TICK_SPACING);
-        hook.removeFbPool(origin0, origin1);
+        PoolKey memory emptyKey = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(0)),
+            fee: 0,
+            tickSpacing: 0,
+            hooks: IHooks(address(0))
+        });
+        hook.setFbPool(curKey, emptyKey);
 
         // Auto-inferred fb pool (fbKey) should now be used when deeper.
         manager.initialize(curKey, SQRT_PRICE_1_1);
@@ -825,13 +865,19 @@ contract RingFallbackHookTest is Test {
     }
 
     function test_registeredFbPoolWithInvalidWrapper_reverts() public {
-        // Register a pair with a bogus few0 address (no code / wrong underlying). The hook should
-        // validate and treat the route as unavailable, so the swap reverts (no cur fallback).
-        address origin0 = Currency.unwrap(currency0);
-        address origin1 = Currency.unwrap(currency1);
+        // Register an fb pool with a bogus few0 address (no code / wrong underlying). The hook should
+        // validate wrappers at swap time and treat the route as unavailable, so the swap reverts.
         address bogusFew0 = makeAddr("bogusFew0");
 
-        hook.setFbPool(origin0, origin1, bogusFew0, fewB, FEE, TICK_SPACING);
+        PoolKey memory bogusFbKey = PoolKey({
+            currency0: Currency.wrap(bogusFew0 < fewB ? bogusFew0 : fewB),
+            currency1: Currency.wrap(bogusFew0 < fewB ? fewB : bogusFew0),
+            fee: FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(address(0))
+        });
+
+        hook.setFbPool(curKey, bogusFbKey);
 
         manager.initialize(curKey, SQRT_PRICE_1_1);
         manager.initialize(fbKey, _fbPriceForBetterZeroForOne());
